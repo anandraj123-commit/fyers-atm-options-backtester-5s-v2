@@ -1,0 +1,14 @@
+{
+  "name": "fyers-atm-options-backtester-5s-v2",
+  "version": "4.3.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node --env-file=.env src/server.js",
+    "start": "node --env-file=.env src/server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}

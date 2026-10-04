@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FYERS ATM Options Backtester 5S V2</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+<header>
+  <div><h1>FYERS ATM Options Backtester 5S V2</h1><p>NIFTY / BANKNIFTY · ATM CE/PE · FYERS expired F&O</p></div>
+  <div class="auth-panel">
+    <span id="authStatus" class="bad" role="status">● FYERS Not Connected</span>
+    <a id="connectFyers" class="connect" href="/api/fyers/login">Connect FYERS</a>
+  </div>
+</header>
+<p id="authError" class="error-message" role="alert" hidden></p>
+<nav aria-label="Backtesting tools">
+  <button type="button" class="tab active" data-tab="back">Backtesting</button>
+  <button type="button" class="tab" data-tab="opt">Backtesting &amp; Optimisation</button>
+</nav>
+<main>
+  <section id="back" class="panel active">
+    <h2>Backtesting</h2>
+    <form id="backForm"><div id="backFields"></div><button type="button" id="runBack">Run Backtest</button></form>
+    <div id="backStatus" class="status-message" role="status"></div><div id="summary"></div>
+    <h3>Trade Ledger</h3><div class="tableWrap"><table id="trades"></table></div>
+    <h3>Skipped / Unavailable Trades</h3><pre id="skipped"></pre>
+  </section>
+  <section id="opt" class="panel">
+    <h2>Backtesting &amp; Optimisation</h2>
+    <form id="optForm">
+      <div id="optFields"></div>
+      <fieldset class="field-group"><legend>Optimisation</legend>
+        <div id="modeFields" class="grid"></div>
+        <p id="searchDescription" class="help-text"></p>
+        <p id="searchWarning" class="warning-message" role="status" hidden></p>
+        <div class="actions"><button type="button" id="runOpt">Run Optimisation</button><button type="button" id="cancelOpt" class="secondary" disabled>Cancel Optimisation</button></div>
+      </fieldset>
+    </form>
+    <div id="optStatus" class="status-message" aria-live="polite"></div>
+    <div id="best"></div>
+    <p id="retentionInfo" class="help-text"></p>
+    <div id="resultControls" class="actions" hidden><button type="button" id="prevResults">Previous</button><span id="resultPage"></span><button type="button" id="nextResults">Next</button><a id="exportResults">Export stored results (NDJSON)</a></div>
+    <div class="tableWrap"><table id="results"></table></div>
+  </section>
+</main>
+</body>
+</html>
