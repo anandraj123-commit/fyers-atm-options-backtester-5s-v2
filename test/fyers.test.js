@@ -27,10 +27,32 @@ test("regular/expired endpoint parameters match published schema and support 5S 
  await assert.rejects(expiredHistory("T","NSE:NIFTY2692225500CE","10S","2026-09-21","2026-09-21"),/unsupported resolution/);
  await assert.rejects(get("/history",{symbol:"NSE:NIFTY50-INDEX",resolution:"1",date_format:1,range_from:"2026-02-30",range_to:"2026-09-21"},"T"),/date range/);
 });
+test("expiry response diagnostics retain safe endpoint/status/record counts",async t=>{
+ mock(t,async()=>new Response(JSON.stringify({s:"ok",code:0,data:{expiry_dates:{options:["2026-09-22",{expiry_date:"2026-09-29"}]}}}),{status:200}));
+ const diagnostics=[];const response=await expiryDates("PRIVATE_EXPIRY_TOKEN","NSE:NIFTY50-INDEX","2026-09-10","2026-09-30",{onResponse:row=>diagnostics.push(row)});
+ assert.equal(response.data.expiry_dates.options.length,2);assert.equal(diagnostics.length,1);assert.equal(diagnostics[0].endpoint,"GET https://api-t1.fyers.in/data/history/fno/expired/expiry-dates");
+ assert.equal(diagnostics[0].httpStatus,200);assert.equal(diagnostics[0].fyersCode,0);assert.equal(diagnostics[0].rawExpiryRecords,2);assert.equal(diagnostics[0].params.range_from,"2026-09-10");
+ assert.doesNotMatch(JSON.stringify(diagnostics),/PRIVATE_EXPIRY_TOKEN|Authorization|secret/i);
+});
 test("history ranges chunk: minute <=100 days; seconds bounded multi-day ranges, never fallback",async t=>{
  const calls=[];mock(t,async url=>{calls.push(new URL(url));return new Response(JSON.stringify({s:"ok",candles:[]}));});
  await history("T","NSE:NIFTY50-INDEX","1","2026-01-01","2026-04-15");assert.equal(calls.length,2);assert.equal(calls[0].searchParams.get("range_to"),"2026-04-10");
  calls.length=0;await history("T","NSE:NIFTY50-INDEX","5S","2026-09-21","2026-09-23");assert.equal(calls.length,1);assert.ok(calls.every(c=>c.searchParams.get("resolution")==="5S"));assert.equal(calls[0].searchParams.get("range_to"),"2026-09-23");
+});
+test("live preparation progress counts successful history chunks including cached chunks",async t=>{
+ let calls=0;mock(t,async()=>{calls++;return new Response(JSON.stringify({s:"ok",candles:[]}));});
+ const first=[];await history("PROGRESS_CACHE","NSE:NIFTY50-INDEX","5S","2026-09-01","2026-09-06",{purpose:"mandatory underlying execution 5S",onPreparationProgress:event=>first.push(event)});
+ const completionSequence=events=>events.filter((x,i,all)=>x.completed>0&&all.findIndex(y=>y.completed===x.completed&&y.total===x.total)===i).map(x=>[x.completed,x.total,x.unit]);
+ assert.deepEqual(completionSequence(first),[[1,2,"chunks"],[2,2,"chunks"]]);assert.equal(first.at(-1).percentage,undefined);
+ const cached=[];await history("PROGRESS_CACHE","NSE:NIFTY50-INDEX","5S","2026-09-01","2026-09-06",{purpose:"mandatory underlying execution 5S",onPreparationProgress:event=>cached.push(event)});
+ assert.equal(calls,2);assert.deepEqual(completionSequence(cached).map(([done,total])=>[done,total]),[[1,2],[2,2]]);
+ const strategy=[];await history("PROGRESS_STRATEGY","NSE:NIFTY50-INDEX","1","2026-01-01","2026-04-11",{purpose:"strategy candles 1m",onPreparationProgress:event=>strategy.push(event)});
+ assert.deepEqual(completionSequence(strategy).map(([done,total,_unit])=>[done,total,"strategy_spot"]),[[1,2,"strategy_spot"],[2,2,"strategy_spot"]]);
+});
+test("429 waiting/retrying does not increment completed history chunks before success",async t=>{
+ let calls=0;mock(t,async()=>{calls++;return calls===1?new Response(JSON.stringify({s:"error",code:429,message:"request limit reached"}),{status:429,headers:{"Retry-After":"0"}}):new Response(JSON.stringify({s:"ok",candles:[]}));});
+ const events=[];await history("PROGRESS_RETRY","NSE:NIFTY50-INDEX","5S","2026-09-01","2026-09-01",{purpose:"mandatory underlying execution 5S",onPreparationProgress:event=>events.push(event)});
+ assert.ok(events.some(x=>x.status==="waiting_rate_limit"&&x.completed===0&&x.total===1));assert.deepEqual(events.filter(x=>x.status==="complete").map(x=>[x.completed,x.total]),[[1,1]]);assert.equal(calls,2);
 });
 test("100 concurrent equivalent FYERS history requests make one network request",async t=>{
  let calls=0;mock(t,async()=>{calls++;await new Promise(resolve=>setTimeout(resolve,5));return new Response(JSON.stringify({s:"ok",candles:[]}));});

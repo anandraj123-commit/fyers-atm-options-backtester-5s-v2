@@ -1,7 +1,7 @@
 import {validDate} from "./fyers.js";
-import {chooseExpiry,chooseATM} from "./contracts.js";
+import {chooseExpiry,chooseATM,contractLotDiagnostic} from "./contracts.js";
 import {CHARGE_KEYS,fyersOptionCharges} from "./charges.js";
-import {ymdIST,sessionDateEpoch} from "./time.js";
+import {ymdIST,sessionDateEpoch,inSession} from "./time.js";
 import {SYMBOLS,marketStore,prepareMarket,candidates,lowerBound,remember,marketDataSummary} from "./market.js";
 export {optimise} from "./optimiser.js";
 const iso=t=>new Date(t*1000).toISOString();
@@ -90,34 +90,54 @@ export function exitEvent(data,candidate,cfg,entry,sl,target){
   if(!exit){const m=rows[lowerBound(rows,end)];if(m?.t!==end)throw new Error(`Required underlying 5S 15:15 open unavailable on ${candidate.day}`);exit={t:end,reason:"15:15",spot:m.o};}
   return remember(data,data.exits,key,exit);
 }
-export async function simulate(data,cfg,{check=()=>{},yieldEvery=100}={}){
-  const trades=[],skipped=[];let capital=cfg.startingCapital,busyUntil=-Infinity,losses=0,lastDay=null,count=0;
-  for(const candidate of candidates(data,cfg)){
+export async function simulate(data,cfg,{check=()=>{},yieldEvery=100,onPreparationProgress=()=>{}}={}){
+  const trades=[],skipped=[],signals=candidates(data,cfg),pipelineCounters={eligible1mCandles:data.strategy.filter(c=>{const d=ymdIST(c.t);return d>=cfg.startDate&&d<=cfg.endDate&&inSession(c.t);}).length,
+    buyASignals:0,buyBSignals:0,sellASignals:0,sellBSignals:0,signalsPassingMinStopDistance:0,pendingSetups:0,breakoutsTriggered:0,entriesRequiringOptions:0,
+    weeklyExpiriesResolved:new Set(data.applicableExpiryByDay?.values?.()??[]).size,optionContractsResolved:0,optionPremiumHistoriesLoaded:new Set(),tradesExecuted:0};
+  for(const candidate of signals){
+    pipelineCounters[candidate.sig.side.toLowerCase()+candidate.sig.type+"Signals"]++;
+    const denominator=candidate.sig.side==="BUY"?candidate.sc.h:candidate.sc.l;
+    if((candidate.sc.h-candidate.sc.l)/denominator*100>=cfg.minStopLossDistancePct)pipelineCounters.signalsPassingMinStopDistance++;
+  }
+  const pipelineSnapshot=()=>({...pipelineCounters,optionPremiumHistoriesLoaded:pipelineCounters.optionPremiumHistoriesLoaded.size,tradesExecuted:trades.length});
+  const incompleteTradeData=message=>Object.assign(new Error(message),{code:"INCOMPLETE_MARKET_DATA",incompleteData:true,pipelineCounters:pipelineSnapshot(),marketData:marketDataSummary(data,cfg)});
+  let capital=cfg.startingCapital,busyUntil=-Infinity,losses=0,lastDay=null,count=0;
+  const actualContracts=new Set(),validatedPremiumHistories=new Set();
+  for(const candidate of signals){
     check();if(++count%yieldEvery===0)await new Promise(resolve=>setImmediate(resolve));
     const {sc,sig,day,ema,emaPrevious}=candidate,close=sc.t+Number(cfg.resolution)*60,end=sessionDateEpoch(day,"15:15");
     if(day!==lastDay){lastDay=day;losses=0;busyUntil=-Infinity;}
     if(close>=end||close<=busyUntil||losses>=cfg.maxConsecutiveLosses||sc.h<=sc.l)continue;
     const stopDistancePct=(sc.h-sc.l)/(sig.side==="BUY"?sc.h:sc.l)*100;
     if(stopDistancePct<cfg.minStopLossDistancePct)continue;
+    pipelineCounters.pendingSetups++;
     const b=breakout(data,candidate,cfg);busyUntil=b.end;
     if(!b.trigger||b.trigger.t>=b.end)continue;
+    pipelineCounters.breakoutsTriggered++;pipelineCounters.entriesRequiringOptions++;
     const trigger=b.trigger,expiryKey=`${day}:${cfg.expiryType}`;
     if(!data.expirySelections.has(expiryKey))remember(data,data.expirySelections,expiryKey,chooseExpiry(data.classified,day,cfg.expiryType));
     const expiry=data.expirySelections.get(expiryKey);
     const skip=(reason,unavailable=false,more={})=>skipped.push({day,signalTime:iso(sc.t),reason,unavailable,...more});
-    if(!expiry)throw new Error(`Required weekly expiry unavailable for breakout on ${day}; backtest cannot use an incomplete weekly-options dataset`);
+    if(!expiry)throw incompleteTradeData(`Required weekly expiry unavailable for breakout on ${day}; backtest cannot use an incomplete weekly-options dataset`);
     const optType=sig.side==="BUY"?"CE":"PE",contractKey=`${expiry}:${cfg.expiryType}:${optType}:${trigger.spot}`;
+    onPreparationProgress({stage:"option_contracts",status:"resolving",completed:actualContracts.size,total:null,unit:"contracts",activity:`Resolving ATM weekly ${optType} contract for ${day}`});
     if(!data.contractSelections.has(contractKey)){
       remember(data,data.contractSelections,contractKey,chooseATM(data.contractsByExpiry.get(expiry)||[],trigger.spot,optType,cfg.expiryType));
       data.cacheStats.contractSelections++;
     }
     const contract=data.contractSelections.get(contractKey);
-    if(!contract)throw new Error(`Required actual ATM ${optType} weekly contract unavailable for expiry ${expiry} on ${day}; no substitute contract is allowed`);
-    if(!contract.lotSize)throw new Error(`Historical lot size unavailable for required contract ${contract.symbol} on ${day}; no current lot-size fallback is allowed`);
-    const oc=await data.getOptions(contract,day);
-    if(!oc.length)throw new Error(`FYERS ${cfg.optionResolution} option premium data unavailable: ${contract.symbol} ${day}. No premium fabricated.`);
+    if(!contract)throw incompleteTradeData(`Required actual ATM ${optType} weekly contract unavailable for expiry ${expiry} on ${day}; no substitute contract is allowed`);
+    if(!contract.lotSize)throw incompleteTradeData(`Historical lot size unavailable for required contract ${contract.symbol} on ${day}; no current lot-size fallback is allowed. Safe contract metadata: ${JSON.stringify(contractLotDiagnostic(contract))}`);
+    actualContracts.add(contract.symbol);
+    onPreparationProgress({stage:"option_contracts",status:"resolving",completed:actualContracts.size,total:null,unit:"contracts",activity:`ATM option contract resolved — ${contract.symbol} (${actualContracts.size} resolved; total not yet known)`});
+    pipelineCounters.optionContractsResolved++;
+    const historyKey=`${contract.symbol}:${day}`;
+    onPreparationProgress({stage:"option_premiums",status:"fetching",completed:validatedPremiumHistories.size,total:null,unit:"histories",activity:`Fetching historical option premium — ${contract.symbol} — ${day}`});
+    let oc;try{oc=await data.getOptions(contract,day);}catch(error){throw incompleteTradeData(error.message);}
+    pipelineCounters.optionPremiumHistoriesLoaded.add(`${contract.symbol}:${day}`);
+    if(!oc.length)throw incompleteTradeData(`FYERS ${cfg.optionResolution} option premium data unavailable: ${contract.symbol} ${day}. No premium fabricated.`);
     const ep=findPremium(oc,trigger.t,b.end-1);
-    if(!ep)throw new Error(`Required option entry premium unavailable after breakout for ${contract.symbol} on ${day}; no premium may be fabricated`);
+    if(!ep)throw incompleteTradeData(`Required option entry premium unavailable after breakout for ${contract.symbol} on ${day}; no premium may be fabricated`);
     // The pending entry occupies time until its actual premium fill. Risk monitoring
     // starts only at that fill, never in the bar before the position existed.
     const risk=sc.h-sc.l,sl=sig.side==="BUY"?sc.l:sc.h,target=sig.side==="BUY"?sc.h+risk*cfg.rr:sc.l-risk*cfg.rr;
@@ -125,19 +145,21 @@ export async function simulate(data,cfg,{check=()=>{},yieldEvery=100}={}){
     if(exit.reason.startsWith("AMBIGUOUS")){
       // Preserve exclusion of ambiguous trades; reserve the remainder of the session
       // because their P&L/loss-guard state cannot be known. No favourable re-entry.
-      busyUntil=end;skip(exit.reason,false,{contract:contract.symbol,eventTime:iso(exit.t),entryTime:iso(ep.t),optionEntryPremium:ep.price,handling:"EXCLUDED_FROM_PNL; DAY_BLOCKED_SEQUENCE_UNKNOWN"});continue;
+      busyUntil=end;validatedPremiumHistories.add(historyKey);onPreparationProgress({stage:"option_premiums",status:"fetching",completed:validatedPremiumHistories.size,total:null,unit:"histories",activity:`Option premium history validated — ${contract.symbol} — ${validatedPremiumHistories.size} histories loaded`});skip(exit.reason,false,{contract:contract.symbol,eventTime:iso(exit.t),entryTime:iso(ep.t),optionEntryPremium:ep.price,handling:"EXCLUDED_FROM_PNL; DAY_BLOCKED_SEQUENCE_UNKNOWN"});continue;
     }
     const xp=findPremium(oc,exit.t,end);
-    if(!xp)throw new Error(`No temporally valid ${cfg.optionResolution} option exit open by 15:15 for ${contract.symbol} on ${day}; cannot close without fabricating a premium`);
+    if(!xp)throw incompleteTradeData(`No temporally valid ${cfg.optionResolution} option exit open by 15:15 for ${contract.symbol} on ${day}; cannot close without fabricating a premium`);
+    validatedPremiumHistories.add(historyKey);
+    onPreparationProgress({stage:"option_premiums",status:"fetching",completed:validatedPremiumHistories.size,total:null,unit:"histories",activity:`Option premium history validated — ${contract.symbol} — ${validatedPremiumHistories.size} histories loaded`});
     busyUntil=xp.t;
     const qty=cfg.lots*contract.lotSize,gross=(xp.price-ep.price)*qty,charges=fyersOptionCharges({buyPrice:ep.price,sellPrice:xp.price,qty,tradeDate:day}),net=gross-charges.total,before=capital;
     capital+=net;
     const rows=data.byDay.get(day),entrySpot=rows[lowerBound(rows,ep.t)],exitSpot=rows[lowerBound(rows,xp.t)];
-    if(entrySpot?.t!==ep.t||exitSpot?.t!==xp.t)throw new Error("Underlying 5S observation missing at option fill timestamp");
-    trades.push({tradeNo:trades.length+1,date:day,direction:sig.side,setup:sig.type,optionType:optType,positionSide:"LONG",expiryType:cfg.expiryType,expiryDate:expiry,
+    if(entrySpot?.t!==ep.t||exitSpot?.t!==xp.t)throw incompleteTradeData("Underlying 5S observation missing at option fill timestamp");
+    trades.push({tradeNo:trades.length+1,date:day,tradeDate:day,underlying:cfg.symbol,direction:sig.side,setup:sig.type,optionType:optType,positionSide:"LONG",expiryType:cfg.expiryType,expiryDate:expiry,
       signalTime:iso(sc.t),signalOpen:sc.o,signalHigh:sc.h,signalLow:sc.l,signalClose:sc.c,ema,emaSlope:ema-emaPrevious,emaSlopeDirection:sig.side==="BUY"?"UP":"DOWN",
       breakoutPrice:sig.side==="BUY"?sc.h:sc.l,breakoutConfirmedTime:iso(trigger.t),breakoutConfirmation:trigger.confirmation,atmReferenceSpot:trigger.spot,atmReferenceSource:trigger.spotSource??"OBSERVED_5S_OPEN",
-      entryTime:iso(ep.t),spotEntry:entrySpot.o,atmStrike:contract.strike,contract:contract.symbol,optionEntryPremium:ep.price,lots:cfg.lots,lotSize:contract.lotSize,lotSizeSource:contract.lotSizeSource,quantity:qty,
+      entryTime:iso(ep.t),spotEntry:entrySpot.o,atmStrike:contract.strike,contract:contract.symbol,optionEntryPremium:ep.price,lots:cfg.lots,configuredLots:cfg.lots,lotSize:contract.lotSize,historicalLotSize:contract.lotSize,lotSizeSource:contract.lotSizeSource,lotSizeMetadataField:contract.lotSizeMetadataField??null,lotSizeMetadataValue:contract.lotSizeMetadataValue??null,quantity:qty,actualQuantity:qty,
       underlyingSL:sl,underlyingTarget:target,exitEventTime:iso(exit.t),exitTime:iso(xp.t),spotExit:exitSpot.o,optionExitPremium:xp.price,exitReason:exit.reason,
       grossPnl:gross,grossProfit:Math.max(0,gross),grossLoss:Math.min(0,gross),...Object.fromEntries(CHARGE_KEYS.map(k=>[k,charges[k]])),totalCharges:charges.total,
       netPnl:net,netProfit:Math.max(0,net),netLoss:Math.min(0,net),capitalAfter:capital,tradeReturnPct:before>0?net/before*100:null,
@@ -145,7 +167,11 @@ export async function simulate(data,cfg,{check=()=>{},yieldEvery=100}={}){
       fillRule:FILL_RULE,source:"FYERS_HISTORY_AND_EXPIRED_FNO",expiryTypeSource:contract.expiryTypeSource});
     losses=net<0?losses+1:0;
   }
-  return {config:cfg,summary:resultSummary(trades,cfg.startingCapital,skipped),marketData:marketDataSummary(data,cfg),trades,skipped};
+  pipelineCounters.optionPremiumHistoriesLoaded=pipelineCounters.optionPremiumHistoriesLoaded.size;
+  pipelineCounters.tradesExecuted=trades.length;
+  onPreparationProgress({stage:"option_contracts",status:"complete",completed:actualContracts.size,total:actualContracts.size,unit:"contracts",activity:`Required ATM option contracts resolved — ${actualContracts.size} / ${actualContracts.size}`});
+  onPreparationProgress({stage:"option_premiums",status:"complete",completed:validatedPremiumHistories.size,total:validatedPremiumHistories.size,unit:"histories",activity:`Required option premium histories validated — ${validatedPremiumHistories.size} / ${validatedPremiumHistories.size}`});
+  return {config:cfg,summary:resultSummary(trades,cfg.startingCapital,skipped),marketData:marketDataSummary(data,cfg),pipelineCounters,trades,skipped};
 }
 export async function backtest(token,input,options={}){
   const cfg=normalize(input);let data=options.data;
@@ -154,6 +180,6 @@ export async function backtest(token,input,options={}){
     return await simulate(data,cfg,options);
   }catch(error){
     const wrapped=new Error(`Required market data or trade prices are incomplete. The backtest was not run. ${error.message}`);
-    wrapped.code="MARKET_DATA_PREPARATION";wrapped.cause=error;throw wrapped;
+    wrapped.code="MARKET_DATA_PREPARATION";wrapped.incompleteData=true;wrapped.pipelineCounters=error.pipelineCounters;wrapped.marketData=error.marketData;wrapped.cause=error;throw wrapped;
   }
 }

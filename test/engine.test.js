@@ -13,6 +13,14 @@ test("signal candle cannot execute; option entry/exit never use a pre-event open
  assert.equal(t.optionEntryPremium,10);assert.equal(t.optionExitPremium,12);assert.equal(t.grossPnl,100);assert.equal(t.netPnl,100-t.totalCharges);assert.equal(t.capitalAfter,100000+t.netPnl);
  assert.equal(t.spotEntry,104);assert.equal(t.positionSide,"LONG");assert.equal(t.optionPriceResolution,"1");assert.match(t.fillRule,/Never use/);
 });
+test("backtest progress reports actual ATM contract and validated premium history units without changing trades",async()=>{
+ const f=fixture(),events=[],withProgress=await simulate(f.data,cfg,{onPreparationProgress:event=>events.push(event)}),withoutProgress=await run(fixture());
+ assert.deepEqual(withProgress.trades,withoutProgress.trades);assert.equal(withProgress.summary.totalReturnPct,withoutProgress.summary.totalReturnPct);
+ assert.ok(events.some(x=>x.stage==="option_contracts"&&x.unit==="contracts"&&x.completed===1&&x.total===null&&x.status==="resolving"));
+ assert.ok(events.some(x=>x.stage==="option_premiums"&&x.unit==="histories"&&x.completed===0&&x.total===null&&x.status==="fetching"));
+ assert.deepEqual(events.filter(x=>x.stage==="option_contracts"&&x.status==="complete").map(x=>[x.completed,x.total]),[[1,1]]);
+ assert.deepEqual(events.filter(x=>x.stage==="option_premiums"&&x.status==="complete").map(x=>[x.completed,x.total]),[[1,1]]);
+});
 for(const sell of [false,true])test(`strict ${sell?"SELL <":"BUY >"} breakout, equality never triggers`,()=>{
  const f=fixture({sell,target:false});
  for(const m of f.data.monitor){if(m.t>=start+60&&m.t<start+240)Object.assign(m,sell?bar(m.t,100,102,97,100):bar(m.t,100,103,98,100));}
@@ -36,8 +44,21 @@ test("ignore signals while position open; do not replay earlier setups after exi
 test("SELL buys PE and also earns (exit-entry)*quantity",async()=>{
  const r=await run(fixture({sell:true}));assert.equal(r.trades.length,1);const t=r.trades[0];assert.equal(t.optionType,"PE");assert.equal(t.direction,"SELL");assert.equal(t.grossPnl,100);assert.equal(t.underlyingSL,102);assert.equal(t.underlyingTarget,92);
 });
+test("configured lots multiply verified historical lot size for quantity, P&L and charges",async()=>{
+ const one=await run(fixture({lotSize:50}));const two=await run(fixture({lotSize:50}),{lots:2});
+ assert.equal(one.trades[0].lots,1);assert.equal(one.trades[0].quantity,50);assert.equal(one.trades[0].grossPnl,100);
+ assert.equal(two.trades[0].lots,2);assert.equal(two.trades[0].quantity,100);assert.equal(two.trades[0].grossPnl,200);
+ assert.equal(two.trades[0].stt,one.trades[0].stt*2);
+ assert.equal(two.trades[0].underlying,"NIFTY");assert.equal(two.trades[0].tradeDate,day);
+});
 test("no historical lot-size fallback; missing required metadata stops the backtest",async()=>{
  await assert.rejects(run(fixture({lotSize:null}),{fallbackLotSize:999}),/Historical lot size unavailable.*no current lot-size fallback/);
+});
+test("missing ATM contract or required option premium after a confirmed breakout is incomplete market data",async()=>{
+ const missingContract=fixture().data;missingContract.contractsByExpiry.set("2026-09-22",[]);
+ await assert.rejects(simulate(missingContract,cfg),error=>error.incompleteData===true&&error.pipelineCounters.entriesRequiringOptions===1&&/actual ATM CE weekly contract unavailable/.test(error.message));
+ const missingPremium=fixture().data;missingPremium.getOptions=async()=>[];
+ await assert.rejects(simulate(missingPremium,cfg),error=>error.incompleteData===true&&error.pipelineCounters.optionContractsResolved===1&&error.pipelineCounters.optionPremiumHistoriesLoaded===1&&/option premium data unavailable/.test(error.message));
 });
 test("09:15 start, weekdays only",async()=>{
  assert.equal(inSession(start-5),false);assert.equal(inSession(start),true);assert.equal(inSession(sessionDateEpoch("2026-09-26")),false);assert.equal(inSession(sessionDateEpoch("2026-09-27")),false);

@@ -28,7 +28,7 @@ test("HTTP backtest reports preparation failure as NOT RUN, not a valid empty le
   return new Response(JSON.stringify({s:"ok",candles}));
  });
  const base=await server(t,{token:"PREP_FAILURE_TOKEN"}),response=await post(base+"/api/backtest",cfg),body=await response.json();
- assert.equal(response.status,503);assert.equal(body.status,"failed");assert.equal(body.phase,"preparing_data");assert.match(body.error,/BACKTEST NOT RUN/);assert.match(body.error,/No mandatory underlying 5-second candles returned/);assert.equal(body.trades,undefined);
+ assert.equal(response.status,503);assert.equal(body.status,"failed");assert.equal(body.phase,"preparing_data");assert.equal(body.incompleteData,true);assert.match(body.error,/BACKTEST NOT RUN/);assert.match(body.error,/No mandatory underlying 5-second candles returned/);assert.equal(body.trades,undefined);
 });
 test("HTTP optimisation start/progress/cancel endpoints remain responsive",async t=>{
  let finish;const base=await server(t,{token:"PRIVATE",optimise:async(token,cfg,options)=>{
@@ -39,6 +39,16 @@ test("HTTP optimisation start/progress/cancel endpoints remain responsive",async
  const {id}=await (await post(base+"/api/optimise",input)).json();const progress=await(await fetch(base+`/api/optimise/${id}`)).json();assert.equal(progress.status,"running");assert.equal(progress.processed,10);
  assert.equal((await post(base+"/api/optimise",input)).status,400);
  await post(base+`/api/optimise/${id}/cancel`,{});const done=await(await fetch(base+`/api/optimise/${id}`)).json();assert.equal(done.status,"cancelled");assert.equal(done.exhaustive,false);finish();
+});
+test("backtest status exposes live stage units and percentages without changing data work",{timeout:5000},async t=>{
+ let report,release;const base=await server(t,{token:"PRIVATE",backtest:async(_token,_cfg,options)=>{report=options.onPreparationProgress;report({stage:"execution_spot",status:"fetching",completed:0,total:20,unit:"chunks",activity:"Fetching 5-second NIFTY spot data — chunk 1 / 20"});return new Promise(resolve=>{release=()=>resolve({summary:{trades:0},trades:[],skipped:[]});});}});
+ const pending=post(base+"/api/backtest",cfg);let status;
+ try{
+  for(let i=0;i<30;i++){status=await(await fetch(base+"/api/status")).json();if(status.marketDataProgress?.stages?.execution_spot)break;await new Promise(r=>setTimeout(r,10));}
+  assert.equal(status.marketDataProgress.status,"preparing_data");assert.equal(status.marketDataProgress.stages.execution_spot.percentage,0);assert.equal(status.marketDataProgress.stages.execution_spot.completed,0);
+  for(const [completed,percentage]of [[1,5],[10,50],[19,95],[20,100]]){report({stage:"execution_spot",status:completed===20?"complete":"fetching",completed,total:20,unit:"chunks",activity:`${completed} of 20`});status=await(await fetch(base+"/api/status")).json();assert.equal(status.marketDataProgress.stages.execution_spot.percentage,percentage);assert.equal(status.marketDataProgress.stages.execution_spot.completed,completed);}
+ }finally{release?.();}
+ assert.equal((await pending).status,200);
 });
 test("HTTP optimiser exposes queued/preparation and rate-limit wait states without evaluating",async t=>{
  const base=await server(t,{token:"PRIVATE",optimise:async(_token,_cfg,options)=>{options.onProgress({status:"waiting_rate_limit",stage:"Preparing Market Data",requested:12,evaluated:0,message:"FYERS request limit reached. Waiting before retry. Retry 1/2"});return new Promise(resolve=>options.signal.addEventListener("abort",()=>resolve({status:"cancelled",mode:"FAST",requested:12,evaluated:0,bestResult:null,exhaustive:false}),{once:true}));}});
@@ -134,7 +144,8 @@ test("real optimisation HTTP preparation parses FYERS 5S OHLCV and evaluates FAS
    else candles=[...Array.from({length:4},(_,i)=>[sessionDateEpoch(addDays(date,-4),"15:10")+i*60,"24850","24855","24845","24852","0"]),...Array.from({length:360},(_,i)=>[sessionStart+i*60,"24850.10","24855.00","24845.00","24852.00","0"])];
    return new Response(JSON.stringify({s:"ok",candles}));
   }
-  if(u.pathname.endsWith("/expiry-dates"))return new Response(JSON.stringify({s:"ok",data:{expiry_dates:{options:[]}}}));
+  if(u.pathname.endsWith("/expiry-dates"))return new Response(JSON.stringify({s:"ok",data:{expiry_dates:{options:["2026-09-22"]}}}));
+  if(u.pathname.endsWith("/underlying-symbols"))return new Response(JSON.stringify({s:"ok",data:{contracts:{options:[{symbol:"NSE:NIFTY26922105CE",lot_size:50}]}}}));
   if(u.pathname.endsWith("/options-chain-v3"))return new Response(JSON.stringify({s:"ok",data:{expiryData:[],optionsChain:[]}}));
   assert.fail(`Unexpected safe FYERS endpoint ${u.pathname}`);
  });

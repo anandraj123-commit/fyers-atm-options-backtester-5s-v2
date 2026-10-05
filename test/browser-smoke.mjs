@@ -13,7 +13,7 @@ import {fixture} from "./fixtures.js";
 const profile=await mkdtemp(join(tmpdir(),"fyers-ui-smoke-"));
 let base,backtestInput,winningReturn,winningParams,winningConfig,chrome,ws,server;
 const app=createApp({callbackUrl:()=>new URL(base+"/api/fyers/callback"),loginUrl:state=>base+`/api/fyers/callback?state=${state}&auth_code=MOCK_CODE`,exchangeAuthCode:async()=>"MOCK_PRIVATE_TOKEN",
- backtest:async(token,cfg)=>{assert.equal(token,"MOCK_PRIVATE_TOKEN");backtestInput=cfg;return {summary:{trades:0,totalReturnPct:winningReturn},trades:[],skipped:[]};},
+ backtest:async(token,cfg,options)=>{assert.equal(token,"MOCK_PRIVATE_TOKEN");backtestInput=cfg;options.onProgress("Fetching 1m strategy SPOT candles: mocked browser smoke");await new Promise(resolve=>setTimeout(resolve,350));return {summary:{trades:0,totalReturnPct:winningReturn},trades:[],skipped:[]};},
  optimise:async(token,cfg,options)=>{const result=await runOptimisation(token,cfg,{...options,data:fixture().data,maxBytes:0,fastLimit:60,evaluate:async(_data,c)=>{
   const returnPct=c.emaLength+c.slopeLookback+c.entryValidCandles+c.rr+c.maxConsecutiveLosses+c.minStopLossDistancePct;
   return {summary:{totalReturnPct:returnPct,netPnl:returnPct,totalCharges:0,trades:1,ambiguousCount:0,incompleteData:false},skipped:[]};
@@ -48,7 +48,7 @@ try{
  winningReturn=Number((await evaluate(`document.querySelector('.best-return').textContent`)).replace("%",""));assert.ok(winningReturn>0);
  assert.equal(await evaluate(`document.querySelector('.best-card h3').textContent`),"BEST RESULT FOUND — FAST MODE");
  await writeFile(join(tmpdir(),"fyers-ui-desktop.png"),Buffer.from((await send("Page.captureScreenshot",{format:"png",captureBeyondViewport:true})).data,"base64"));
- await evaluate(`document.querySelector('#apply').click()`);await until(`document.querySelector('#backStatus').textContent === 'Complete'`);
+ await evaluate(`document.querySelector('#apply').click()`);assert.equal(await evaluate(`!!document.querySelector('#backStatus .prep-progress-fill.indeterminate')`),true);await until(`document.querySelector('#backStatus').innerHTML.includes('aria-valuenow="100"') && document.querySelector('#backStatus').innerText.includes('MARKET DATA READY')`);
  assert.ok(backtestInput,`Apply Best did not call the detailed backtest; status: ${await evaluate(`document.querySelector('#optStatus').textContent + '\\n' + document.querySelector('#backStatus').textContent`)}`);
  for(const key of ["emaLength","slopeLookback","entryValidCandles","rr","maxConsecutiveLosses"])assert.equal(String(backtestInput[key]),String(winningParams[key]));assert.equal(backtestInput.minStopLossDistancePct,winningParams.minStopLossDistancePct);assert.equal(backtestInput.expiryType,"WEEKLY");assert.equal(backtestInput.resolution,"1");assert.equal(backtestInput.emaSeedDate,winningConfig.emaSeedDate);
  await send("Emulation.setDeviceMetricsOverride",{width:390,height:844,deviceScaleFactor:1,mobile:true});

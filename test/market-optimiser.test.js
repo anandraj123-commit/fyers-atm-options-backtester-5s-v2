@@ -89,7 +89,7 @@ test("market preparation enforces 1m strategy data and separate 5S execution for
   const calls=[],store=createMarketStore("RESOLUTION_TEST",{
    async history(_token,symbol,res,from){calls.push({symbol,res,from});if(res==="5S")return Array.from({length:4321},(_,i)=>bar(start+i*5));
     return [...warmRows(day),...Array.from({length:360},(_,i)=>i===0?bar(start,99,103,98,102):bar(start+i*60,104))];},
-   async expiryDates(){return {data:{expiry_dates:{options:[]}}};},async expiredSymbols(){return {data:{contracts:{options:[]}}};},async expiredHistory(){return {s:"ok",candles:[]};}
+   async expiryDates(){return {data:{expiry_dates:{options:["2026-09-22"]}}};},async expiredSymbols(){return {data:{contracts:{options:[{symbol:"NSE:NIFTY26922105CE",lot_size:50}]}}};},async expiredHistory(){return {s:"ok",candles:[]};}
   });
   const prepared=await prepareMarket(store,{...cfg,resolution});
   assert.ok(calls.some(x=>x.res==="1"),"1m strategy requested");
@@ -97,6 +97,37 @@ test("market preparation enforces 1m strategy data and separate 5S execution for
   assert.equal(prepared.strategy.filter(x=>x.t>=start&&x.t<sessionDateEpoch(day,"15:15")).length,360);
   assert.equal(prepared.monitor.length,4321);
  }
+});
+test("valid zero-trade run still reports discovered weekly expiry and explicit zero signal counters",async()=>{
+ const store=createMarketStore("ZERO_SIGNAL_WEEKLY",{
+  async history(_token,_symbol,res){return res==="5S"?Array.from({length:4321},(_,i)=>bar(start+i*5,104)): [...warmRows(day),...Array.from({length:360},(_,i)=>bar(start+i*60,104))];},
+  async expiryDates(){return {data:{expiry_dates:{options:["2026-09-22"]}}};},
+  async expiredSymbols(){return {data:{contracts:{options:[{symbol:"NSE:NIFTY26922105CE",lot_size:50}]}}};}
+ });
+ const data=await prepareMarket(store,cfg),result=await simulate(data,cfg);
+ assert.equal(result.trades.length,0);assert.equal(result.summary.incompleteData,false);
+ assert.equal(result.marketData.resolvedExpiries,1);assert.equal(result.marketData.weeklyExpiryDatesDiscovered,1);
+ assert.equal(result.pipelineCounters.eligible1mCandles,360);assert.equal(result.pipelineCounters.buyASignals+result.pipelineCounters.buyBSignals+result.pipelineCounters.sellASignals+result.pipelineCounters.sellBSignals,0);
+ assert.equal(result.pipelineCounters.breakoutsTriggered,0);assert.equal(result.pipelineCounters.tradesExecuted,0);
+ assert.ok(result.marketData.expiryDiagnostics.some(x=>x.endpoint.endsWith("expiry-dates")&&x.parsedExpiryRecords===1&&x.weeklyAfterFiltering===1));
+});
+test("preparation emits truthful weekly-session and contract-catalog totals as units succeed",async()=>{
+ const events=[],store=createMarketStore("PROGRESS_EXPIRIES",{
+  async history(_token,_symbol,res){return res==="5S"?Array.from({length:4321},(_,i)=>bar(start+i*5,104)):[...warmRows(day),...Array.from({length:360},(_,i)=>bar(start+i*60,104))];},
+  async expiryDates(){return {data:{expiry_dates:{options:["2026-09-22"]}}};},
+  async expiredSymbols(){return {data:{contracts:{options:[{symbol:"NSE:NIFTY26922105CE",lot_size:50}]}}};}
+ });
+ const data=await prepareMarket(store,cfg,{onPreparationProgress:event=>events.push(event)});
+ assert.deepEqual(events.filter(x=>x.stage==="option_contracts"&&x.unit==="expiry catalogs"&&x.status==="complete").map(x=>[x.completed,x.total]),[[1,1]]);
+ assert.deepEqual(events.filter(x=>x.stage==="weekly_expiries"&&x.status==="complete").map(x=>[x.completed,x.total,x.unit]),[[1,1,"sessions"]]);
+ assert.equal(data.tradingDays,1);
+});
+test("weekly expiry discovery failure and parser discard stop preparation before a zero-trade result",async()=>{
+ const base={async history(_token,_symbol,res){return res==="5S"?Array.from({length:4321},(_,i)=>bar(start+i*5,104)): [...warmRows(day),...Array.from({length:360},(_,i)=>bar(start+i*60,104))];},async expiredSymbols(){return {data:{contracts:{options:[]}}};}};
+ const missing=createMarketStore("NO_WEEKLY_EXPIRY",{...base,async expiryDates(){return {data:{expiry_dates:{options:[]}}};}});
+ await assert.rejects(prepareMarket(missing,cfg),error=>error.incompleteData===true&&/Weekly expiry resolution failed/.test(error.message)&&/expiry-dates/.test(error.message));
+ const malformed=createMarketStore("UNPARSEABLE_EXPIRY",{...base,async expiryDates(){return {data:{expiry_dates:{options:[{expiry:"22-09-2026"}]}}};}});
+ await assert.rejects(prepareMarket(malformed,cfg),/parser rejected all 1 expired FYERS expiry records/);
 });
 test("no-data holidays are skipped without fabricating trades",async()=>{
  const store=createMarketStore("T",{history:async()=>[]});const data=await prepareMarket(store,cfg);assert.equal(data.noDataDays,true);assert.equal((await simulate(data,cfg)).trades.length,0);

@@ -3,7 +3,7 @@ import {historyRequestDiagnostics} from "./fyers.js";
 import {readFile} from "node:fs/promises";
 import {createHash} from "node:crypto";
 import {addDays,ymdIST,inSession} from "./time.js";
-import {extractExpiryDates,extractContracts,extractActiveExpiries,extractActiveContracts,classifyExpiries} from "./contracts.js";
+import {extractExpiryDates,extractContracts,extractActiveExpiries,extractActiveContracts,classifyExpiries,chooseExpiry} from "./contracts.js";
 import {emaSeries,signalAt} from "./strategy.js";
 export const SYMBOLS={NIFTY:"NSE:NIFTY50-INDEX",BANKNIFTY:"NSE:NIFTYBANK-INDEX"};
 const stores=new Map();
@@ -55,10 +55,15 @@ export function buildDataset(strategy,monitor,extra={}){
 }
 export function marketDataSummary(data,cfg){
   const selectedContracts=new Set([...data.contractSelections.values()].filter(Boolean).map(x=>x.symbol));
+  const resolvedExpiryDates=new Set(data.applicableExpiryByDay?.values?.()??[]);
   return {backtestStart:cfg.startDate,backtestEnd:cfg.endDate,strategyResolution:cfg.resolution,
     strategyRangeStart:data.strategyRangeStart??null,strategyRangeEnd:cfg.endDate,executionRangeStart:cfg.startDate,executionRangeEnd:cfg.endDate,
     tradingDays:data.tradingDays??0,strategyCandles:data.strategy.length,executionCandles:data.monitor.length,
-    resolvedExpiries:[...(data.expirySelections?.values()??[])].filter(Boolean).length,requiredOptionContracts:selectedContracts.size,
+    // Report expiries resolved for the requested trading dates, not only
+    // expiries touched by an executed entry. A valid zero-signal run can still
+    // have its weekly expiry infrastructure verified and counted here.
+    resolvedExpiries:resolvedExpiryDates.size,weeklyExpiryDatesDiscovered:data.weeklyExpiryDatesDiscovered??0,
+    expiryDiagnostics:data.expiryDiagnostics??[],requiredOptionContracts:selectedContracts.size,
     optionPremiumCandles:[...data.optionData.values()].reduce((n,rows)=>n+rows.length,0),historyRequests:historyRequestDiagnostics()};
 }
 export function warmupStart(startDate,emaLength,slopeLookback,resolution){
@@ -128,11 +133,12 @@ export function candidates(data,cfg){
   }
   return data.signals.get(key);
 }
-export async function prepareMarket(store,cfg,{maxEMA=cfg.emaLength,maxSlope=cfg.slopeLookback,onProgress=()=>{},onDataStatus=()=>{},signal,check=()=>{}}={}){
+export async function prepareMarket(store,cfg,{maxEMA=cfg.emaLength,maxSlope=cfg.slopeLookback,onProgress=()=>{},onPreparationProgress=()=>{},onDataStatus=()=>{},signal,check=()=>{}}={}){
   cfg={...cfg,resolution:"1",expiryType:"WEEKLY"};
   const symbol=SYMBOLS[cfg.symbol];
+  const failStage=(stage,activity,unit)=>onPreparationProgress({stage,status:"failed",unit,activity});
   const warm=cfg.emaSeedDate??warmupStart(cfg.startDate,maxEMA,maxSlope,cfg.resolution);
-  const requestOptions={signal,onState:onDataStatus};
+  const requestOptions={signal,onState:onDataStatus,onPreparationProgress};
   onProgress(`Fetching ${cfg.resolution}m strategy SPOT candles: ${warm} to ${cfg.endDate}`);
   check();
   const strategy=(await store.history(symbol,"1",warm,cfg.endDate,{...requestOptions,purpose:"strategy candles 1m"})).filter(c=>{const d=ymdIST(c.t);return d>=warm&&d<=cfg.endDate;});
@@ -142,36 +148,45 @@ export async function prepareMarket(store,cfg,{maxEMA=cfg.emaLength,maxSlope=cfg
   const data=buildDataset(strategy,monitor,{store,symbol,strategyRangeStart:warm});
   const activeDays=new Set(strategy.filter(c=>ymdIST(c.t)>=cfg.startDate&&inSession(c.t)).map(c=>ymdIST(c.t)));
   for(const [day,rows] of data.byDay){
-    if(rows.some(c=>inSession(c.t))&&!activeDays.has(day))throw new Error(`Strategy candles unavailable on ${day} despite underlying 5S observations; cannot evaluate signals`);
+    if(rows.some(c=>inSession(c.t))&&!activeDays.has(day)){failStage("strategy_spot","Strategy candles unavailable for an execution session","chunks");throw new Error(`Strategy candles unavailable on ${day} despite underlying 5S observations; cannot evaluate signals`);}
   }
   for(const day of activeDays){
     const rows=data.byDay.get(day)||[];
-    if(!rows.length)throw new Error(`NO 5S DATA RETURNED: No mandatory underlying 5-second candles returned by FYERS for ${day}. Endpoint: GET /data/history; Symbol: ${symbol}; Resolution: 5S; range_from=${day}; range_to=${day}; date_format=1; cont_flag=0. This strategy requires 5S spot data for breakout, Stop Loss and Target; no minute fallback is allowed.`);
+    if(!rows.length){failStage("execution_spot","No mandatory 5-second spot candles returned","chunks");throw new Error(`NO 5S DATA RETURNED: No mandatory underlying 5-second candles returned by FYERS for ${day}. Endpoint: GET /data/history; Symbol: ${symbol}; Resolution: 5S; range_from=${day}; range_to=${day}; date_format=1; cont_flag=0. This strategy requires 5S spot data for breakout, Stop Loss and Target; no minute fallback is allowed.`);}
     // Full mandatory trading session must be present. A missing bar could conceal
     // a breakout/stop/target; silently bridging it would change the strategy.
     const start=Date.parse(`${day}T09:15:00+05:30`)/1000,end=Date.parse(`${day}T15:15:00+05:30`)/1000;
     const strategyDay=strategy.filter(c=>ymdIST(c.t)===day);
     let strategyIndex=lowerBound(strategyDay,start);
     for(let t=start;t<end;t+=Number(cfg.resolution)*60){
-      if(strategyDay[strategyIndex++]?.t!==t)throw new Error(`Strategy candle missing at ${new Date(t*1000).toISOString()}; cannot evaluate EMA/signals reliably`);
+      if(strategyDay[strategyIndex++]?.t!==t){failStage("strategy_spot","Required 1-minute strategy candle missing during session validation","chunks");throw new Error(`Strategy candle missing at ${new Date(t*1000).toISOString()}; cannot evaluate EMA/signals reliably`);}
     }
     let i=lowerBound(rows,start);
-    for(let t=start;t<=end;t+=5){if(rows[i++]?.t!==t)throw new Error(`FYERS 5S HISTORY INCOMPLETE: mandatory underlying candle missing at ${new Date(t*1000).toISOString()} (${day}, IST ${new Date((t+19800)*1000).toISOString().slice(11,19)}); breakout/SL/Target cannot be verified. No interpolation or fallback.`);}
+    for(let t=start;t<=end;t+=5){if(rows[i++]?.t!==t){failStage("execution_spot","Mandatory 5-second spot session has a missing candle","chunks");throw new Error(`FYERS 5S HISTORY INCOMPLETE: mandatory underlying candle missing at ${new Date(t*1000).toISOString()} (${day}, IST ${new Date((t+19800)*1000).toISOString().slice(11,19)}); breakout/SL/Target cannot be verified. No interpolation or fallback.`);}}
   }
-  if(!activeDays.size){data.noDataDays=true;data.classified=[];data.contractsByExpiry=new Map();return data;}
-  if(strategy.filter(c=>ymdIST(c.t)<cfg.startDate).length<maxEMA+maxSlope) throw new Error("Insufficient completed strategy candles for EMA/slope warm-up; requested historical data unavailable");
+  if(!activeDays.size){data.noDataDays=true;data.classified=[];data.contractsByExpiry=new Map();onPreparationProgress({stage:"weekly_expiries",status:"complete",completed:0,total:0,unit:"sessions",activity:"No trading sessions require expiry resolution"});onPreparationProgress({stage:"option_contracts",status:"complete",completed:0,total:0,unit:"expiry catalogs",activity:"No option contract catalogs required"});return data;}
+  if(strategy.filter(c=>ymdIST(c.t)<cfg.startDate).length<maxEMA+maxSlope){failStage("strategy_spot","Insufficient completed 1-minute warm-up candles","chunks");throw new Error("Insufficient completed strategy candles for EMA/slope warm-up; requested historical data unavailable");}
   let verified={};
   if(process.env.HISTORICAL_CONTRACTS_FILE)verified=JSON.parse(await readFile(process.env.HISTORICAL_CONTRACTS_FILE,"utf8"));
   // Trading remains bounded by the form dates. Expiry lookup extends only to
   // cover expiries applicable to those trading days. The expired-only API must
   // never receive today or a future date in range_to.
   const discoveryStart=cfg.startDate,discoveryEnd=expiryDiscoveryEnd(cfg.endDate,"WEEKLY"),today=ymdIST(Date.now()/1000),lastExpired=addDays(today,-1);
-  const dates=new Set();
+  const dates=new Set(),expiryDiagnostics=[];
+  const trace=(details)=>{const row={tradeDateRange:{start:cfg.startDate,end:cfg.endDate},symbol,...details};expiryDiagnostics.push(row);return row;};
+  onPreparationProgress({stage:"weekly_expiries",status:"resolving",completed:0,total:activeDays.size,unit:"sessions",activity:`Resolving weekly expiry metadata for ${activeDays.size} trading sessions`});
   const expiredEnd=discoveryEnd<lastExpired?discoveryEnd:lastExpired;
   if(discoveryStart<=expiredEnd){
     for(let from=discoveryStart;from<=expiredEnd;from=addDays(from,366)){
       check();const to=addDays(from,365)<expiredEnd?addDays(from,365):expiredEnd;
-      for(const d of extractExpiryDates(await store.expiryDates(symbol,from,to,{signal,onState:onDataStatus,purpose:"expired expiry dates for selected trading range"})))dates.add(d);
+      const diagnostic=trace({pathType:"EXPIRED",endpoint:"GET /data/history/fno/expired/expiry-dates",range_from:from,range_to:to,httpStatus:null,fyersCode:null,rawExpiryRecords:0,parsedExpiryRecords:0,weeklyAfterFiltering:0});
+      onProgress(`Resolving weekly expiry metadata: expired dates ${from} to ${to}`);
+      const response=await store.expiryDates(symbol,from,to,{signal,onState:onDataStatus,purpose:"expired expiry dates for selected trading range",onResponse:meta=>Object.assign(diagnostic,meta)});
+      const raw=response.data?.expiry_dates?.options;
+      diagnostic.rawExpiryRecords=Array.isArray(raw)?raw.length:null;
+      const parsed=extractExpiryDates(response);diagnostic.parsedExpiryRecords=parsed.length;
+      if(Array.isArray(raw)&&raw.length&&!parsed.length)throw new Error(`Weekly expiry discovery parser rejected all ${raw.length} expired FYERS expiry records for ${from} to ${to}; response diagnostics=${JSON.stringify(diagnostic)}`);
+      for(const d of parsed)dates.add(d);
     }
   }
   const activeStart=discoveryStart>today?discoveryStart:today;
@@ -179,20 +194,55 @@ export async function prepareMarket(store,cfg,{maxEMA=cfg.emaLength,maxSlope=cfg
   let activeExpiries=[];
   if(needsActive&&typeof store.optionChain==="function"){
     onProgress(`Discovering active expiries for selected trading range: ${activeStart} to ${discoveryEnd}`);
-    activeExpiries=extractActiveExpiries(await store.optionChain(symbol,{signal,onState:onDataStatus,purpose:"active expiry discovery"}));
+    const diagnostic=trace({pathType:"ACTIVE",endpoint:"GET /data/options-chain-v3",range_from:activeStart,range_to:discoveryEnd,httpStatus:null,fyersCode:null,rawExpiryRecords:0,parsedExpiryRecords:0,weeklyAfterFiltering:0});
+    const response=await store.optionChain(symbol,{signal,onState:onDataStatus,purpose:"active expiry discovery",onResponse:meta=>Object.assign(diagnostic,meta)});
+    const raw=response.data?.expiryData;diagnostic.rawExpiryRecords=Array.isArray(raw)?raw.length:null;
+    activeExpiries=extractActiveExpiries(response);diagnostic.parsedExpiryRecords=activeExpiries.length;diagnostic.weeklyAfterFiltering=activeExpiries.filter(x=>x.type==="WEEKLY"&&x.date>=activeStart&&x.date<=discoveryEnd).length;
+    if(Array.isArray(raw)&&raw.length&&!activeExpiries.length)throw new Error(`Weekly expiry discovery parser rejected all ${raw.length} active FYERS expiry records for ${activeStart} to ${discoveryEnd}; response diagnostics=${JSON.stringify(diagnostic)}`);
     for(const e of activeExpiries)if(e.date>=activeStart&&e.date<=discoveryEnd)dates.add(e.date);
   }
   const contractsByExpiry=new Map();
-  for(const expiry of [...dates].sort()){
+  const expiryDates=[...dates].sort();let contractCatalogsCompleted=0;
+  onPreparationProgress({stage:"option_contracts",status:expiryDates.length?"resolving":"waiting",completed:0,total:expiryDates.length,unit:"expiry catalogs",activity:expiryDates.length?`Resolving actual option contract catalogs — 0 / ${expiryDates.length} expiries`:"Waiting for weekly expiry metadata"});
+  for(const expiry of expiryDates){
     check();onProgress(`Fetching actual option contracts for selected trading range: ${expiry}`);
+    onPreparationProgress({stage:"option_contracts",status:"resolving",completed:contractCatalogsCompleted,total:expiryDates.length,unit:"expiry catalogs",activity:`Resolving actual option contracts — expiry ${contractCatalogsCompleted+1} / ${expiryDates.length}: ${expiry}`});
     if(expiry>=today){
       const active=activeExpiries.find(x=>x.date===expiry);
       if(!active)throw new Error(`FYERS active contract metadata does not include required expiry ${expiry} for trading dates ${cfg.startDate} through ${cfg.endDate}`);
-      const chain=await store.optionChain(symbol,active.epoch,{signal,onState:onDataStatus,purpose:"active option contracts for selected expiry"});
-      contractsByExpiry.set(expiry,extractActiveContracts(chain,expiry,active.type,verified));
-    }else contractsByExpiry.set(expiry,extractContracts(await store.contracts(symbol,expiry,{signal,onState:onDataStatus,purpose:"expired option contracts for selected trading range"}),expiry,verified));
+      const diagnostic=trace({tradeDateRange:{start:cfg.startDate,end:cfg.endDate},pathType:"ACTIVE",endpoint:"GET /data/options-chain-v3",expiryDate:expiry,httpStatus:null,fyersCode:null,rawContractRecords:0,parsedContractRecords:0,weeklyAfterFiltering:0});
+      const chain=await store.optionChain(symbol,active.epoch,{signal,onState:onDataStatus,purpose:"active option contracts for selected expiry",onResponse:meta=>Object.assign(diagnostic,meta)});
+      const raw=chain.data?.optionsChain;diagnostic.rawContractRecords=Array.isArray(raw)?raw.length:null;
+      const contracts=extractActiveContracts(chain,expiry,active.type,verified);diagnostic.parsedContractRecords=contracts.length;diagnostic.weeklyAfterFiltering=contracts.filter(x=>x.expiryType==="WEEKLY").length;contractsByExpiry.set(expiry,contracts);
+    }else{
+      const diagnostic=trace({pathType:"EXPIRED",endpoint:"GET /data/history/fno/expired/underlying-symbols",expiryDate:expiry,httpStatus:null,fyersCode:null,rawContractRecords:0,parsedContractRecords:0,weeklyAfterFiltering:0});
+      const response=await store.contracts(symbol,expiry,{signal,onState:onDataStatus,purpose:"expired option contracts for selected trading range",onResponse:meta=>Object.assign(diagnostic,meta)});
+      const raw=response.data?.contracts?.options;diagnostic.rawContractRecords=Array.isArray(raw)?raw.length:null;
+      const contracts=extractContracts(response,expiry,verified);diagnostic.parsedContractRecords=contracts.length;diagnostic.weeklyAfterFiltering=contracts.filter(x=>x.expiryType==="WEEKLY").length;contractsByExpiry.set(expiry,contracts);
+    }
+    contractCatalogsCompleted++;
+    onPreparationProgress({stage:"option_contracts",status:contractCatalogsCompleted===expiryDates.length?"complete":"resolving",completed:contractCatalogsCompleted,total:expiryDates.length,unit:"expiry catalogs",activity:`Actual option contract catalogs — ${contractCatalogsCompleted} / ${expiryDates.length} expiries`});
   }
   data.contractsByExpiry=contractsByExpiry;data.classified=classifyExpiries([...dates].sort(),contractsByExpiry);data.tradingDays=activeDays.size;
+  for(const diagnostic of expiryDiagnostics){
+    if(diagnostic.pathType==="EXPIRED"&&diagnostic.endpoint.endsWith("expiry-dates"))diagnostic.weeklyAfterFiltering=data.classified.filter(x=>x.type==="WEEKLY"&&x.date>=diagnostic.range_from&&x.date<=diagnostic.range_to).length;
+  }
+  data.expiryDiagnostics=expiryDiagnostics;data.weeklyExpiryDatesDiscovered=new Set(data.classified.filter(x=>x.type==="WEEKLY").map(x=>x.date)).size;
+  // Metadata resolution is a prerequisite even on a no-signal/no-entry run.
+  // This verifies the resolver against every session that can be traded without
+  // fetching option premiums or contracts for entries that never occur.
+  data.applicableExpiryByDay=new Map();
+  let expirySessionsCompleted=0;
+  for(const day of activeDays){
+    const expiry=chooseExpiry(data.classified,day,"WEEKLY");
+    if(!expiry){
+      const error=new Error(`Weekly expiry resolution failed for trading date ${day} in requested backtest ${cfg.startDate} to ${cfg.endDate}. FYERS expiry diagnostics: ${JSON.stringify(expiryDiagnostics)}`);
+      error.incompleteData=true;error.marketData=marketDataSummary(data,cfg);throw error;
+    }
+    data.applicableExpiryByDay.set(day,expiry);
+    expirySessionsCompleted++;
+    onPreparationProgress({stage:"weekly_expiries",status:expirySessionsCompleted===activeDays.size?"complete":"resolving",completed:expirySessionsCompleted,total:activeDays.size,unit:"sessions",activity:`Resolving weekly expiry — session ${expirySessionsCompleted} / ${activeDays.size}: ${day}`});
+  }
   data.getOptions=async(contract,day)=>{
     const key=`${contract.symbol}:${cfg.optionResolution}:${day}`;
     if(data.optionsPreparedForOptimization&&!data.optionData.has(key))throw new Error(`Optimisation candidate requested unprepared option history ${key}; candidate evaluation may not fetch FYERS data`);

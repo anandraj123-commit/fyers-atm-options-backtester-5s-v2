@@ -76,6 +76,13 @@ export async function get(path,params,token,options={}){
   catch(error){if(error.name==="AbortError"||error.code==="ABORT_ERR")throw error;throw error;}
   const j=r.body;
   if(!j||typeof j!=="object")throw new Error(`FYERS API ERROR: ${context} returned an invalid response object; params=${JSON.stringify(safe)}`);
+  // Expiry/contract diagnostics contain market metadata and safe request fields
+  // only. They intentionally omit response bodies and all authentication data.
+  const expiryRows=j.data?.expiry_dates?.options,activeExpiryRows=j.data?.expiryData,contractRows=j.data?.contracts?.options,activeContractRows=j.data?.optionsChain;
+  options.onResponse?.({endpoint:`GET ${DATA}${path}`,params:safe,httpStatus:r.status,
+    fyersCode:Number.isFinite(j.code)?j.code:null,fyersMessage:typeof j.message==="string"?redact(j.message,[token]):null,
+    rawExpiryRecords:Array.isArray(expiryRows)?expiryRows.length:Array.isArray(activeExpiryRows)?activeExpiryRows.length:null,
+    rawContractRecords:Array.isArray(contractRows)?contractRows.length:Array.isArray(activeContractRows)?activeContractRows.length:null});
   if(!r.ok||j.s==="error"||(typeof j.code==="number"&&j.code<0)) {
     const details=Object.fromEntries(Object.entries(j.data||{}).filter(([k,v])=>SAFE.has(k)&&typeof v==="string"));
     throw new Error(`FYERS API ERROR: ${context} rejected request (HTTP ${r.status}); FYERS code=${Number.isFinite(j.code)?j.code:"unavailable"}; message=${redact(j.message||"Request rejected",[token])}; params=${JSON.stringify(safe)}; validation=${redact(JSON.stringify(details),[token])}${params.resolution?.endsWith("S")?". FYERS documents seconds history for only the last 30 trading days; no underlying fallback is allowed.":""}`);
@@ -174,12 +181,28 @@ export async function history(token,symbol,resolution,from,to,options={}){
   // bounded multi-session chunks to keep payloads manageable without one call
   // per calendar day.
   const days=String(resolution).endsWith("S")?5:100;
+  const purpose=String(options.purpose??"").toLowerCase();
+  const stage=purpose.includes("option premium")?"option_premiums":purpose.includes("execution 5s")?"execution_spot":"strategy_spot";
+  const optionHistory=stage==="option_premiums";
+  const total=Math.floor((Date.parse(to)-Date.parse(from))/86400000/days)+1;
+  let completed=0,index=0;
+  const report=(status,activity)=>options.onPreparationProgress?.({stage,status,completed:optionHistory?undefined:completed,total:optionHistory?null:total,unit:optionHistory?"histories":"chunks",activity});
+  report("fetching",optionHistory?`Fetching historical option premium — ${symbol}`:`Preparing ${stage==="execution_spot"?"5-second":"1-minute"} spot data`);
   for(let d=from;d<=to;d=addDays(d,days)){
+    const chunkIndex=++index;
     const end=addDays(d,days-1)<to?addDays(d,days-1):to;
     const params=historyRequest(symbol,resolution,d,end);
     const onInvalidOutsideSession=details=>{invalidOutsideSessionCount+=details.count;options.onInvalidOutsideSession?.(details);if(!options.onInvalidOutsideSession&&process.env.NODE_ENV!=="production")console.warn(`FYERS ignored ${details.count} malformed pre/post-session candle(s) outside the required trading window: ${JSON.stringify({endpoint:"GET /data/history",symbol,resolution,date:d,examples:details.examples})}`);};
-    out.push(...parseCandles(await get("/history",params,token,{...options,purpose:options.purpose??`underlying ${resolution}`} ),resolution,{endpoint:"GET /data/history",symbol,resolution,date:d,params,token,
-      allowMalformedOutsideSession:String(resolution).endsWith("S"),onInvalidOutsideSession}));
+    const activity=optionHistory?`Fetching historical option premium — ${symbol} — ${chunkIndex} / ${total} request chunk(s)`:`Fetching ${stage==="execution_spot"?"5-second":"1-minute"} spot data — chunk ${chunkIndex} / ${total} (${d} → ${end})`;
+    report("fetching",activity);
+    try{
+      const requestState=state=>{options.onState?.(state);if(state.status==="waiting_rate_limit")report("waiting_rate_limit",`${activity}; waiting before retry ${state.retry}/${state.maxRetries}`);else if(state.status==="requesting")report("fetching",activity);};
+      const candles=parseCandles(await get("/history",params,token,{...options,onState:requestState,purpose:options.purpose??`underlying ${resolution}`} ),resolution,{endpoint:"GET /data/history",symbol,resolution,date:d,params,token,
+        allowMalformedOutsideSession:String(resolution).endsWith("S"),onInvalidOutsideSession});
+      out.push(...candles);
+      if(!optionHistory)completed++;
+      report(chunkIndex===total&&!optionHistory?"complete":"fetching",optionHistory?activity:`${activity} — ${completed} / ${total} chunks`);
+    }catch(error){report("failed",`${activity} — failed`);throw error;}
   }
   Object.defineProperty(out,"diagnostics",{value:{invalidOutsideSessionCount},enumerable:false});
   return out;

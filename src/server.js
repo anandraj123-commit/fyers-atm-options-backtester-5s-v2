@@ -8,7 +8,21 @@ import {clearMarketStores} from "./market.js";
 import {SYMBOLS} from "./market.js";
 const BUILD_MARKER="4.3.0 | fixed=1m/5S/WEEKLY | optimiser=FAST/EXHAUSTIVE-streaming | fyers-history=scheduled-paced-cached-deduplicated";
 export function createApp(deps={}){
-  const app=express(),jobs=new Map(),states=new Map();let accessToken=deps.token??null,backtestWait=null;
+  const app=express(),jobs=new Map(),states=new Map();let accessToken=deps.token??null,backtestWait=null,backtestProgress=null;
+  const updateBacktestProgress=event=>{
+    if(!backtestProgress)backtestProgress={status:"preparing_data",stages:{},activeStage:null,currentActivity:"Preparing historical market data",overallPercentage:null};
+    const stage=event.stage,previous=backtestProgress.stages[stage]??{stage,status:"waiting",completed:0,total:null,percentage:null};
+    const unit=event.unit??"units",priorWork=previous.work?.[unit]??{completed:0,total:null,percentage:null};
+    const completed=Number.isFinite(event.completed)?event.completed:priorWork.completed,total=event.total===undefined?priorWork.total:Number.isFinite(event.total)?event.total:null;
+    const percentage=total>0?Math.max(0,Math.min(100,Math.floor(completed/total*100))):null;
+    const work={...(previous.work??{}),[unit]:{unit,completed,total,percentage}};
+    backtestProgress.stages[stage]={...previous,...event,work,unit,completed,total,percentage};
+    if(event.status!=="complete")backtestProgress.activeStage=stage;
+    else if(backtestProgress.activeStage===stage)backtestProgress.activeStage=null;
+    backtestProgress.status=event.status==="waiting_rate_limit"?"waiting_rate_limit":"preparing_data";
+    if(event.activity)backtestProgress.currentActivity=redact(String(event.activity),[accessToken]);
+    backtestProgress.overallPercentage=null;
+  };
   function connected(){
     if(accessToken){
       // Expiry is only used to discard an already server-obtained token, never to
@@ -22,7 +36,7 @@ export function createApp(deps={}){
   app.use(express.json({limit:"1mb"}));app.use(express.static(fileURLToPath(new URL("../public/",import.meta.url))));
   const requireToken=()=>{if(!connected())throw new Error("Connect FYERS first.");return accessToken;};
   const run=async(res,fn)=>{try{res.json(await fn());}catch(e){res.status(400).json({error:redact(e.message,[accessToken])});}};
-  app.get("/api/status",(req,res)=>res.json({connected:connected(),build:BUILD_MARKER,marketDataWait:backtestWait,historyRequests:historyRequestDiagnostics()}));
+  app.get("/api/status",(req,res)=>res.json({connected:connected(),build:BUILD_MARKER,marketDataWait:backtestWait,marketDataProgress:backtestProgress,historyRequests:historyRequestDiagnostics()}));
   app.get("/api/debug/fyers-history",async(req,res)=>{
     if(process.env.NODE_ENV==="production")return res.status(404).json({error:"Not found"});
     try{
@@ -65,10 +79,10 @@ export function createApp(deps={}){
   });
   app.post("/api/backtest",async(req,res)=>{
     const controller=new AbortController();res.on("close",()=>{if(!res.writableEnded)controller.abort();});
-    try{const result=await (deps.backtest??backtest)(requireToken(),normalize(req.body),{signal:controller.signal,onDataStatus:status=>{backtestWait=status.status==="waiting_rate_limit"?{retry:status.retry,maxRetries:status.maxRetries,waitMs:status.waitMs}:null;}});if(!res.writableEnded)res.json(result);}
-    catch(error){if(res.writableEnded)return;const prep=error.code==="MARKET_DATA_PREPARATION",message=redact(error.message,[accessToken]);
-      res.status(prep?503:400).json(prep?{status:"failed",phase:"preparing_data",error:`BACKTEST NOT RUN\nRequired market data could not be prepared.\n${message}`}:{error:message});}
-    finally{backtestWait=null;}
+    try{backtestProgress={status:"preparing_data",stages:{},activeStage:null,currentActivity:"Preparing historical market data",overallPercentage:null};const result=await (deps.backtest??backtest)(requireToken(),normalize(req.body),{signal:controller.signal,onPreparationProgress:updateBacktestProgress,onProgress:message=>{if(backtestProgress)backtestProgress.currentActivity=redact(String(message),[accessToken]);},onDataStatus:status=>{backtestWait=status.status==="waiting_rate_limit"?{retry:status.retry,maxRetries:status.maxRetries,waitMs:status.waitMs}:null;if(backtestProgress?.activeStage){const stage=backtestProgress.stages[backtestProgress.activeStage];if(backtestWait){stage.status="waiting_rate_limit";stage.retry=backtestWait.retry;stage.maxRetries=backtestWait.maxRetries;stage.waitMs=backtestWait.waitMs;stage.activity=`Waiting before retry — ${backtestProgress.currentActivity}`;backtestProgress.status="waiting_rate_limit";}else if(status.status==="requesting"||backtestProgress.status==="waiting_rate_limit"){stage.status="fetching";delete stage.retry;delete stage.maxRetries;delete stage.waitMs;backtestProgress.status="preparing_data";}}}});if(!res.writableEnded)res.json(result);}
+    catch(error){if(res.writableEnded)return;const prep=error.code==="MARKET_DATA_PREPARATION",message=redact(error.message,[accessToken]);if(backtestProgress){backtestProgress.status="failed";const stage=backtestProgress.stages[backtestProgress.activeStage];if(stage){stage.status="failed";stage.activity="Preparation failed";}}
+      res.status(prep?503:400).json(prep?{status:"failed",phase:"preparing_data",incompleteData:true,pipelineCounters:error.pipelineCounters??null,marketData:error.marketData??null,error:`BACKTEST NOT RUN\nRequired market data could not be prepared.\n${message}`}:{error:message});}
+    finally{backtestWait=null;backtestProgress=null;}
   });
   app.post("/api/optimise",(req,res)=>run(res,async()=>{
     const token=requireToken(),cfg=normalize(req.body,true),plan=searchPlan(cfg);

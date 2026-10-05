@@ -64,14 +64,14 @@ ATM chooses the nearest **returned** contract strike of the required CE/PE and e
 
 Monthly/weekly classifications use actual contract metadata or the official monthly/weekly **symbol formats**, matched to the returned expiry date. No current weekday schedule, last-date-in-month guess or short-gap daily heuristic is used. DAILY requires explicit metadata identifying an actual daily contract. Missing requested expiry types are reported and are never replaced with another type.
 
-The documented expired-contract response contains symbol strings, **not historical lot sizes**. The app supports returned lot metadata when present. Otherwise it reports the missing quantity, without pricing the trade or using today's lot size. To supply verified metadata, configure `HISTORICAL_CONTRACTS_FILE` in `.env` to a server-side JSON file keyed by exact returned symbol. Each entry must contain:
+The documented expired-contract response can contain plain symbol strings, **without historical lot sizes**. The app uses returned FYERS lot metadata first, an exact-expiry sourced `HISTORICAL_CONTRACTS_FILE` override second, then a finite date-effective NSE lot table where its coverage is verified. The bundled table covers documented NIFTY weekly/monthly and BANKNIFTY monthly expiry transitions from May 2024 onward; unsupported expiry periods fail safely. For those dates, configure `HISTORICAL_CONTRACTS_FILE` in `.env` to a server-side JSON file keyed by exact returned symbol. Each entry must contain:
 
 - `expiryDate`: the exact historical expiry date;
 - `lotSize`: the verified positive integer lot size for that contract;
 - `source`: a nonempty citation/reference to your archived exchange/broker contract metadata;
 - optionally `expiryType`: `DAILY`, `WEEKLY` or `MONTHLY`, supported by that source.
 
-No metadata values are bundled or guessed. This file augments actual FYERS-returned contracts; it cannot create a nonexistent contract. Restart/reconnect after updating metadata if you want a fresh API snapshot.
+This file augments actual FYERS-returned contracts; it cannot create a nonexistent contract. Restart/reconnect after updating metadata if you want a fresh API snapshot. Bundled effective dates come from [NSE/FAOP/61415](https://nsearchives.nseindia.com/content/circulars/FAOP61415.pdf), [NSE/FAOP/64625](https://nsearchives.nseindia.com/content/circulars/FAOP64625.pdf), [NSE/FAOP/67372](https://nsearchives.nseindia.com/content/circulars/FAOP67372.pdf), and [NSE/FAOP/70616](https://nsearchives.nseindia.com/content/circulars/FAOP70616.pdf).
 
 ## Charges and ledger
 

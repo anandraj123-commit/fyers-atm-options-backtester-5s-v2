@@ -1,6 +1,6 @@
 import {normalize,simulate,breakout} from "./engine.js";
 import {marketStore,prepareMarket,warmupStart,marketDataSummary,candidates} from "./market.js";
-import {chooseExpiry,chooseATM} from "./contracts.js";
+import {chooseExpiry,chooseATM,contractLotDiagnostic} from "./contracts.js";
 import {historyRequestDiagnostics} from "./fyers.js";
 import {createResultStore,compareResults} from "./results.js";
 
@@ -48,7 +48,7 @@ async function prepareOptimizationOptions(data,cfg,plan,{check=()=>{},onProgress
       const expiry=chooseExpiry(data.classified,day,"WEEKLY");if(!expiry)throw new Error(`Required weekly expiry unavailable for breakout on ${day}`);
       const optionType=sig.side==="BUY"?"CE":"PE",contract=chooseATM(data.contractsByExpiry.get(expiry)||[],pending.trigger.spot,optionType,"WEEKLY");
       if(!contract)throw new Error(`Required actual ATM ${optionType} weekly contract unavailable for ${expiry} on ${day}`);
-      if(!contract.lotSize)throw new Error(`Historical lot size unavailable for required contract ${contract.symbol} on ${day}`);
+      if(!contract.lotSize)throw new Error(`Historical lot size unavailable for required contract ${contract.symbol} on ${day}. Safe contract metadata: ${JSON.stringify(contractLotDiagnostic(contract))}`);
       const optionRows=await data.getOptions(contract,day),fill=optionRows.find(row=>row.t>=pending.trigger.t&&row.t<pending.end&&row.o>0&&row.v>0);
       if(!fill)throw new Error(`Required option entry premium unavailable after breakout for ${contract.symbol} on ${day}`);
       required++;
@@ -141,7 +141,7 @@ export async function optimise(token,input,options={}){
       const returnPct=result.summary.incompleteData?null:result.summary.totalReturnPct;
       if(returnPct!==null&&!Number.isFinite(returnPct))throw new Error("Candidate returned a non-finite return; search is incomplete");
       const row={combination:state.evaluated+1,...parameters,maxConsecutiveLossesPerDay:parameters.maxConsecutiveLosses,resolution:cfg.resolution,returnPct,totalReturnPct:returnPct,
-        netPnl:result.summary.netPnl,totalCharges:result.summary.totalCharges,trades:result.summary.trades,skippedCount:result.skipped.length,ambiguousCount:result.summary.ambiguousCount,
+        netPnl:result.summary.netPnl,totalCharges:result.summary.totalCharges,trades:result.summary.trades,pipelineCounters:result.pipelineCounters,skippedCount:result.skipped.length,ambiguousCount:result.summary.ambiguousCount,
         eligible:returnPct!==null,status:returnPct===null?"DATA_UNAVAILABLE":"EVALUATED",reason:result.skipped.find(x=>x.unavailable)?.reason??""};
       state.evaluated++;
       if(!row.eligible)state.unavailableCandidates++;
