@@ -6,9 +6,11 @@ import {backtest,normalize} from "./engine.js";
 import {optimise,searchPlan} from "./optimiser.js";
 import {clearMarketStores} from "./market.js";
 import {SYMBOLS} from "./market.js";
+import {backtestSpot,normalizeSpot,spotRequestCounters} from "./spot-engine.js";
+import {optimiseSpot,spotSearchPlan} from "./spot-optimiser.js";
 const BUILD_MARKER="4.3.0 | fixed=1m/5S/WEEKLY | optimiser=FAST/EXHAUSTIVE-streaming | fyers-history=scheduled-paced-cached-deduplicated | retry-lifecycle=bounded-timeout-v2";
 export function createApp(deps={}){
-  const app=express(),jobs=new Map(),states=new Map();let accessToken=deps.token??null,backtestWait=null,backtestProgress=null;
+  const app=express(),jobs=new Map(),spotJobs=new Map(),states=new Map();let accessToken=deps.token??null,backtestWait=null,backtestProgress=null;
   const updateBacktestProgress=event=>{
     if(!backtestProgress)backtestProgress={status:"preparing_data",stages:{},activeStage:null,currentActivity:"Preparing historical market data",overallPercentage:null,startedAt:Date.now()};
     const stage=event.stage,previous=backtestProgress.stages[stage]??{stage,status:"waiting",completed:0,total:null,percentage:null};
@@ -84,6 +86,28 @@ export function createApp(deps={}){
       res.status(prep?503:400).json(prep?{status:"failed",phase:"preparing_data",incompleteData:true,pipelineCounters:error.pipelineCounters??null,marketData:error.marketData??null,error:`BACKTEST NOT RUN\nRequired market data could not be prepared.\n${message}`}:{error:message});}
     finally{backtestWait=null;backtestProgress=null;}
   });
+  // Independent spot-only workflow. It uses only the shared scheduled/cacheable
+  // 1m history method; it never calls the options engine or its preparation.
+  app.post("/api/spot-backtest",(req,res)=>run(res,()=>{
+    const token=requireToken(),cfg=normalizeSpot(req.body,false),id=crypto.randomUUID(),controller=new AbortController();
+    const job={controller,state:{id,jobId:id,workflow:"spot_backtest",status:"queued",stage:"Queued",historyRequests:spotRequestCounters(),config:cfg,startedAt:Date.now(),progress:null,result:null}};spotJobs.set(id,job);
+    setImmediate(async()=>{try{job.state.status="preparing_data";job.state.stage="Fetching 1-Minute Spot Data";job.state.progress={};
+      const result=await (deps.backtestSpot??backtestSpot)(token,cfg,{signal:controller.signal,store:deps.spotStore,diagnosticCounters:job.state.historyRequests,onProgress:event=>{job.state.progress={...job.state.progress,[event.stage]:event};job.state.stage=event.stage;job.state.currentActivity=event.activity;job.state.status=event.status==="complete"?"processing":event.stage==="running_backtest"?"running":"preparing_data";job.state.elapsed=(Date.now()-job.state.startedAt)/1000;}});
+      job.state={...job.state,status:"complete",stage:"Complete",completedAt:Date.now(),elapsed:(Date.now()-job.state.startedAt)/1000,result};
+    }catch(error){job.state={...job.state,status:controller.signal.aborted?"cancelled":"failed",stage:controller.signal.aborted?"Cancelled":"Failed",reason:redact(error.message,[token]),elapsed:(Date.now()-job.state.startedAt)/1000};}});
+    return {id,jobId:id,status:"queued",workflow:"spot_backtest"};
+  }));
+  app.get("/api/spot-backtest/:id",(req,res)=>run(res,()=>{requireToken();const j=spotJobs.get(req.params.id);if(!j)throw new Error("Unknown spot backtest job");return {...j.state,elapsed:["complete","failed","cancelled"].includes(j.state.status)?j.state.elapsed:(Date.now()-j.state.startedAt)/1000};}));
+  app.post("/api/spot-backtest/:id/cancel",(req,res)=>run(res,()=>{requireToken();const j=spotJobs.get(req.params.id);if(!j)throw new Error("Unknown spot backtest job");j.controller.abort();return {cancellationRequested:true};}));
+  app.post("/api/spot-optimise",(req,res)=>run(res,()=>{
+    const token=requireToken(),cfg=normalizeSpot(req.body,true),plan=spotSearchPlan(cfg),id=crypto.randomUUID(),controller=new AbortController();
+    const job={controller,state:{id,jobId:id,workflow:"spot_optimise",status:"queued",mode:cfg.mode,stage:"Queued",config:cfg,requested:plan.requested,evaluated:0,startedAt:Date.now(),bestResult:null}};spotJobs.set(id,job);
+    setImmediate(async()=>{try{const result=await (deps.optimiseSpot??optimiseSpot)(token,cfg,{signal:controller.signal,store:deps.spotStore,onProgress:event=>{job.state={...job.state,...event,id,jobId:id,config:cfg,workflow:"spot_optimise",elapsed:(Date.now()-job.state.startedAt)/1000};}});job.state={...job.state,...result,id,jobId:id,config:cfg,workflow:"spot_optimise",completedAt:Date.now()};}
+      catch(error){job.state={...job.state,status:"failed",stage:"Interrupted",reason:redact(error.message,[token]),elapsed:(Date.now()-job.state.startedAt)/1000};}});
+    return {id,jobId:id,status:"queued",mode:cfg.mode,requested:plan.requested,workflow:"spot_optimise"};
+  }));
+  app.get("/api/spot-optimise/:id",(req,res)=>run(res,()=>{requireToken();const j=spotJobs.get(req.params.id);if(!j)throw new Error("Unknown spot optimisation job");return {...j.state,elapsed:["complete","failed","cancelled","incomplete"].includes(j.state.status)?j.state.elapsed:(Date.now()-j.state.startedAt)/1000};}));
+  app.post("/api/spot-optimise/:id/cancel",(req,res)=>run(res,()=>{requireToken();const j=spotJobs.get(req.params.id);if(!j)throw new Error("Unknown spot optimisation job");j.controller.abort();return {cancellationRequested:true};}));
   app.post("/api/optimise",(req,res)=>run(res,async()=>{
     const token=requireToken(),cfg=normalize(req.body,true),plan=searchPlan(cfg);
     if([...jobs.values()].some(j=>["queued","preparing","preparing_data","waiting_rate_limit","running","sorting"].includes(j.state.status)))throw new Error("An optimisation is already running; cancel it before starting another");

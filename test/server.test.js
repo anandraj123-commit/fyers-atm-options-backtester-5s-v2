@@ -17,6 +17,17 @@ test("HTTP backtest validates config, preserves server-only token, and returns s
  const stale=await post(base+"/api/backtest",{...cfg,resolution:"15",expiryType:"MONTHLY"});assert.equal(stale.status,200);assert.equal(seen.cfg.resolution,"1");assert.equal(seen.cfg.expiryType,"WEEKLY");
  const status=await (await fetch(base+"/api/status")).json();assert.equal(status.connected,true);assert.match(status.build,/optimiser=FAST\/EXHAUSTIVE-streaming/);
 });
+test("spot-only backtest and optimisation HTTP routes force 1m and return spot-only diagnostics",async t=>{
+ const day="2026-06-01",session=sessionDateEpoch(day,"09:15"),candles=[...Array.from({length:4},(_,i)=>[sessionDateEpoch(addDays(day,-3),"15:10")+i*60,100,101,99,100,0]),...Array.from({length:360},(_,i)=>[session+i*60,100,101,99,100,0])],calls=[];
+ const spotStore={history:async(...args)=>{calls.push(args);return candles.map(([t,o,h,l,c,v])=>({t,o,h,l,c,v}));}};
+ const base=await server(t,{token:"PRIVATE_SPOT",spotStore}),input={symbol:"NIFTY",startDate:day,endDate:day,emaLength:2,slopeLookback:1,entryValidCandles:2,rr:2,maxConsecutiveLosses:2,minStopLossDistancePct:0,resolution:"15",expiryType:"MONTHLY",executionResolution:"5S"};
+ const started=await post(base+"/api/spot-backtest",input),job=await started.json();assert.equal(started.status,200);let status;
+ for(let i=0;i<100;i++){status=await(await fetch(base+`/api/spot-backtest/${job.jobId}`)).json();if(["complete","failed","cancelled"].includes(status.status))break;await new Promise(r=>setTimeout(r,10));}
+ assert.equal(status.status,"complete",status.reason);assert.equal(status.historyRequests.execution5sRequests,0);assert.equal(status.result.config.resolution,"1");assert.equal(status.result.trades.length,0);assert.equal(calls.length,1);assert.equal(calls[0][0],"NSE:NIFTY50-INDEX");assert.equal(calls[0][1],"1");assert.equal(status.result.diagnostics.historyRequests.execution5sRequests,0);assert.equal(status.result.diagnostics.historyRequests.expiryRequests,0);assert.equal(status.result.diagnostics.historyRequests.optionHistoryRequests,0);
+ const opt={...input,mode:"EXHAUSTIVE",emaMin:2,emaMax:2,emaStep:1,slopeMin:1,slopeMax:1,slopeStep:1,validMin:1,validMax:1,rrMin:2,rrMax:2,rrStep:1,lossMin:1,lossMax:1,stopDistanceMin:0,stopDistanceMax:0,stopDistanceStep:.1};
+ const startedOpt=await post(base+"/api/spot-optimise",opt),optJob=await startedOpt.json();assert.equal(startedOpt.status,200);for(let i=0;i<100;i++){status=await(await fetch(base+`/api/spot-optimise/${optJob.jobId}`)).json();if(["complete","failed","cancelled","incomplete"].includes(status.status))break;await new Promise(r=>setTimeout(r,10));}
+ assert.equal(status.status,"complete",status.reason);assert.equal(status.evaluated,1);assert.equal(status.exhaustive,true);assert.equal(status.config.resolution,"1");assert.equal(calls.length,2);assert.equal(calls[1][1],"1");
+});
 test("HTTP backtest reports preparation failure as NOT RUN, not a valid empty ledger",async t=>{
  const networkFetch=globalThis.fetch.bind(globalThis),date=cfg.startDate,session=sessionDateEpoch(date,"09:15");
  t.mock.method(globalThis,"fetch",async(url,options)=>{

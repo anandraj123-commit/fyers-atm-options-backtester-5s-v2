@@ -134,3 +134,66 @@ An optional real-browser smoke test runs with `node test/browser-smoke.mjs` (ins
 
 A successful **authenticated live FYERS backtest is not claimed**. No live token/session was available during implementation. Actual account permissions, API responses, retained 5S coverage and historical lot metadata still determine whether a requested live run can complete. OHLC cannot recover intrabar tick ordering or exact crossing prices. The app reports these limits rather than inventing data.
 # fyers-atm-options-backtester-5s-v2
+
+## Separate 1-minute spot workflows
+
+**1-Minute Backtesting** and **1-Minute Backtesting & Optimisation** use only
+`NSE:NIFTY50-INDEX` or `NSE:NIFTYBANK-INDEX` with FYERS `resolution=1`.
+The existing ATM options workflow keeps its 1-minute signals, 5-second spot
+execution, weekly contracts and actual option premiums.
+
+Both new tabs run the same spot simulator and the existing EMA/signal functions.
+T0 is a completed signal candle; only T1 through T(N) may break its high/low
+strictly. Entry is the signal high for BUY or low for SELL. SL is the opposite
+signal extreme and target is entry ± signal range × RR. Only one setup or
+position is active. New signals are ignored while either is active.
+
+The stop-distance filter is signal range / signal high × 100 for BUY, or signal
+range / signal low × 100 for SELL. Zero disables it; fractional percentages are
+supported. OHLC cannot reveal intrabar order: SL takes precedence over target,
+including on a breakout candle. A stop touched on the breakout candle is treated
+conservatively as a loss even if its ordering relative to entry is unknown.
+
+The 15:14 candle remains eligible for entry. At its completion (15:15), pending
+setups are cancelled and unresolved trades exit at that candle's close as EOD.
+No position carries overnight. Event timestamps use candle completion times;
+holding durations are minute-level estimates, not inferred tick times. TARGET
+resets the daily consecutive-SL counter, SL increments it, and EOD leaves it
+unchanged. The counter resets each trading day; the reported maximum streak is
+also measured within trading days.
+
+Signal totals count all signal candles in the trading window; accepted pending
+setups count only signals accepted while flat, without an existing pending setup,
+and below the daily loss limit. Warmup candles never trade. EMA seeding uses a
+deterministic warmup date for each parameter set, even when an optimisation has
+fetched a wider common dataset. Partial sessions fail validation; dates with no
+candles are treated as no-data/holiday dates and are never synthesized.
+
+Resolved win rate = TARGET / (TARGET + SL). Resolved loss rate = SL / (TARGET + SL).
+Expectancy R = resolved win fraction × RR − resolved loss fraction. EOD is
+excluded from both; target hit rate over all entries includes EOD in its
+denominator. With no resolved trades these statistics are reported as zero.
+
+Optimisation prepares one shared dataset and caches indicators/signals with
+bounded retention. FAST performs a deterministic coarse search and refinement
+(default limit: 12,000 candidates, configurable with `SPOT_FAST_CANDIDATE_LIMIT`).
+It is labelled non-exhaustive. EXHAUSTIVE streams every combination; cancellation
+retains evaluated results and cannot claim completion. The best 10,000 candidate
+records are retained, ranked by:
+
+1. Expectancy R descending.
+2. Resolved trade count descending.
+3. Resolved win rate descending.
+4. EMA, slope lookback, entry validity, RR, minimum stop distance and daily loss
+   limit, each ascending in that order.
+
+Apply Best copies only the six spot strategy parameters into the spot backtest
+form. Market and dates remain user controlled. It does not change options inputs.
+Request diagnostics are scoped to each spot job, including cache hits, in-flight
+deduplication, retries and 429 responses. Network attempts are attributed to the
+job that starts the shared request; other callers record a deduplication. Options
+traffic running concurrently does not affect spot counters.
+
+Run `npm test` for the complete suite. `node test/browser-smoke.mjs` also exercises
+both spot tabs and the existing options workflow in installed Google Chrome.
+These automated checks mock FYERS; they do not establish live data availability.

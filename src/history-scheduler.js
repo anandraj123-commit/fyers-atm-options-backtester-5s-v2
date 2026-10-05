@@ -33,17 +33,18 @@ export class HistoryRequestScheduler {
   }
   diagnostics(){return {...this.counters,queuedRequests:this.queue.length,activeRequests:this.active,maxConcurrent:this.maxConcurrent,maxRetries:this.maxRetries,minIntervalMs:this.minIntervalMs,cooldownRemainingMs:Math.max(0,this.cooldownUntil-Date.now())};}
   reset(){if(this.active||this.queue.length)throw new Error("Cannot reset FYERS scheduler while requests are active");this.cache.clear();this.inflight.clear();this.cooldownUntil=0;this.cooldownPromise=null;this.nextRequestAt=0;for(const key of Object.keys(this.counters))this.counters[key]=0;}
-  request({endpoint,params,token,purpose="history",signal,onState,cacheIf=()=>true,run}){
-    const isHistory=true;this.counters.logicalRequests++;if(isHistory)this.counters.logicalHistoryRequests++;
+  request({endpoint,params,token,purpose="history",signal,onState,diagnosticCounters,cacheIf=()=>true,run}){
+    const count=key=>{this.counters[key]++;if(diagnosticCounters)diagnosticCounters[key]=(diagnosticCounters[key]??0)+1;};
+    count("logicalRequests");count("logicalHistoryRequests");
     const identity=JSON.stringify({endpoint,params:normalizedParams(params),auth:createHash("sha256").update(String(token)).digest("hex")});
     if(signal?.aborted)return Promise.reject(abortError());
     const cached=this.cache.get(identity);
-    if(cached&&cached.expiresAt>Date.now()){this.counters.cacheHits++;this.#log({event:"cache_hit",endpoint,params,purpose});return Promise.resolve(cached.payload);}
+    if(cached&&cached.expiresAt>Date.now()){count("cacheHits");this.#log({event:"cache_hit",endpoint,params,purpose});return Promise.resolve(cached.payload);}
     if(cached)this.cache.delete(identity);
     let entry=this.inflight.get(identity);
-    if(entry){this.counters.inFlightDeduplications++;this.#log({event:"inflight_dedup",endpoint,params,purpose});}
+    if(entry){count("inFlightDeduplications");this.#log({event:"inflight_dedup",endpoint,params,purpose});}
     else {
-      const controller=new AbortController();entry={identity,endpoint,params,purpose,controller,waiters:0,started:false,onState,cacheIf};
+      const controller=new AbortController();entry={identity,endpoint,params,purpose,controller,waiters:0,started:false,onState,cacheIf,count};
       entry.promise=new Promise((resolve,reject)=>Object.assign(entry,{resolve,reject}));
       this.inflight.set(identity,entry);this.queue.push({...entry,entry,run});
     }
@@ -88,13 +89,13 @@ export class HistoryRequestScheduler {
         if(signal.aborted)throw abortError();
         await this.#acquireSlot(entry,attempt,signal);
         const startedAt=Date.now();
-        const number=this.counters.networkRequests+1;this.counters.networkRequests++;this.counters.networkHistoryRequests++;
+        const number=this.counters.networkRequests+1;entry.count("networkRequests");entry.count("networkHistoryRequests");
         entry.networkRequestNumber=number;
         this.#state(entry,{status:attempt?"retrying":"requesting",attempt:attempt+1,retry:attempt,maxRetries:this.maxRetries,request:number,requestStartedAt:new Date(startedAt).toISOString()});
         const resolution=String(params?.resolution??""),isOption=String(purpose).toLowerCase().includes("option premium");
-        if(!isOption&&resolution==="1")this.counters.oneMinuteRequests++;if(!isOption&&resolution==="5S")this.counters.execution5sRequests++;
-        if(String(endpoint).toLowerCase().includes("expiry")||/expiry|contract/i.test(String(purpose)))this.counters.expiryRequests++;
-        if(isOption)this.counters.optionHistoryRequests++;
+        if(!isOption&&resolution==="1")entry.count("oneMinuteRequests");if(!isOption&&resolution==="5S")entry.count("execution5sRequests");
+        if(String(endpoint).toLowerCase().includes("expiry")||/expiry|contract/i.test(String(purpose)))entry.count("expiryRequests");
+        if(isOption)entry.count("optionHistoryRequests");
         this.#log({event:"network_attempt",request:number,endpoint,params,purpose,attempt:attempt+1});
         try{response=await run(signal);}catch(error){
           if(signal.aborted)throw abortError();
@@ -107,7 +108,7 @@ export class HistoryRequestScheduler {
         const responseAt=Date.now(),elapsedMs=responseAt-startedAt;
         const retryable=response.status===429||response.status>=500;
         this.#state(entry,{event:"response",status:"response",attempt:attempt+1,request:number,requestStartedAt:new Date(startedAt).toISOString(),responseAt:new Date(responseAt).toISOString(),elapsedMs,httpStatus:response.status,retryable});
-        if(response.status===429)this.counters.rateLimitResponses++;
+        if(response.status===429)entry.count("rateLimitResponses");
         if(!retryable||attempt>=this.maxRetries)break;
         const header=response.status===429?retryAfterMs(response.headers?.get?.("retry-after")):null;
         const waitMs=header??Math.round(this.baseDelayMs*2**attempt*(0.75+this.random()*0.5));
@@ -129,7 +130,7 @@ export class HistoryRequestScheduler {
   }
   async #scheduleRetry(entry,{attempt,waitMs,reason,startedAt,responseAt,elapsedMs,httpStatus,retryAfterMs:retryAfter,request,errorName,errorCode,signal}){
     const retry=attempt+1,scheduledAt=Date.now()+waitMs;
-    this.counters.retries++;
+    entry.count("retries");
     this.cooldownUntil=Math.max(this.cooldownUntil,scheduledAt);
     const pause=this.delay(Math.max(0,this.cooldownUntil-Date.now()));this.cooldownPromise=pause;
     pause.finally(()=>{if(this.cooldownPromise===pause){this.cooldownPromise=null;this.cooldownUntil=0;}}).catch(()=>{});

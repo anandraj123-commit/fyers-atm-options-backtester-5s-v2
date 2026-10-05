@@ -69,6 +69,18 @@ test("fixed strategy/execution/expiry are read-only and option resolution stays 
  const page=await readFile(new URL("../public/index.html",import.meta.url),"utf8");assert.doesNotMatch(page,/Execution monitoring: mandatory FYERS/);assert.match(page,/id="connectFyers"[^>]*href="\/api\/fyers\/login"/);
  const css=await readFile(new URL("../public/style.css",import.meta.url),"utf8");assert.match(css,/@keyframes prep-progress-slide/);assert.match(css,/from\{transform:translateX/);assert.match(css,/to\{transform:translateX/);
 });
+test("separate 1-minute spot tabs are fixed to spot-only inputs and report indeterminate progress truthfully",async()=>{
+ const {get,context}=await ui(),page=await readFile(new URL("../public/index.html",import.meta.url),"utf8");
+ assert.match(page,/data-tab="spotBack">1-Minute Backtesting/);assert.match(page,/data-tab="spotOpt">1-Minute Backtesting &amp; Optimisation/);
+ const back=get("#spotBackFields").innerHTML,opt=get("#spotOptFields").innerHTML;
+ assert.match(back,/1 Minute <small>FIXED<\/small>/);assert.doesNotMatch(back,/5 Second Spot|Expiry Type|Option Premium/);
+ assert.match(opt,/1 Minute <small>FIXED<\/small>/);assert.doesNotMatch(opt,/5 Second Spot|Expiry Type|Option Premium|5 Minutes|15 Minutes/);
+ assert.match(page,/FAST — Non-exhaustive/);assert.match(page,/EXHAUSTIVE — Every combination/);assert.match(page,/<option value="FAST" selected>/);
+ const running=context.spotProgressMarkup({status:"preparing_data",stage:"fetching_spot",currentActivity:"Fetching 1-minute spot data",progress:{fetching_spot:{status:"fetching",completed:2,total:4,unit:"chunks"}}});
+ assert.match(running,/Overall progress/);assert.match(running,/Not yet measurable/);assert.match(running,/indeterminate/);assert.match(running,/50% — 2 \/ 4 chunks/);
+ const done=context.spotProgressMarkup({status:"complete",stage:"Complete"});assert.match(done,/100%/);assert.match(done,/COMPLETE/);
+ assert.doesNotMatch((await readFile(new URL("../src/spot-engine.js",import.meta.url),"utf8")),/store\.(options|expiryDates|contracts|activeOptions)\(/);
+});
 test("FAST, complete EXHAUSTIVE, partial and cancelled result labels are truthful",async()=>{
  const {context,get}=await ui();assert.match(context.bestTitle(result),/FAST MODE/);
  const complete={...result,mode:"EXHAUSTIVE",exhaustive:true,evaluated:1000};assert.match(context.bestTitle(complete),/BEST POSSIBLE/);
@@ -89,4 +101,48 @@ test("HTML table keeps existing charge columns, escapes data and paginates trade
 test("invalid optimisation ranges leave Run available and do not start a job",async()=>{
  const {get,context,calls}=await ui();get("#o_emaMin").value="10";get("#o_emaMax").value="5";get("#o_emaStep").value="1";
  await context.runOptimisation();assert.equal(get("#runOpt").disabled,false);assert.equal(calls.length,0);assert.match(get("#optStatus").textContent,/Invalid range/);
+});
+
+test("spot Apply Best changes only the six spot parameters",async()=>{
+ const {get,context,calls}=await ui();const best={emaLength:23,slopeLookback:4,entryValidCandles:3,rr:2.5,minStopLossDistancePct:.15,maxConsecutiveLosses:5,expectancyR:1.25,winRatePct:60,targetHits:3,slHits:2,eodExits:1};
+ for(const key of Object.keys(best))get('#b_'+key).value='unchanged';get('#sb_startDate').value='2026-06-01';
+ context.renderSpotOpt({status:'complete',mode:'FAST',requested:100,evaluated:20,bestResult:best,results:[]});assert.match(get('#spotOptBest').innerHTML,/BEST RESULT FOUND — FAST MODE/);get('#applySpotBest').onclick();
+ for(const key of ['emaLength','slopeLookback','entryValidCandles','rr','minStopLossDistancePct','maxConsecutiveLosses']){assert.equal(get('#sb_'+key).value,String(best[key]));assert.equal(get('#b_'+key).value,'unchanged');}assert.equal(calls.length,0);assert.equal(get('#sb_startDate').value,'2026-06-01');
+});
+test("spot progress blocks finalisation after zero-candidate failure and FAST refinement stays indeterminate",async()=>{
+ const {context,get}=await ui();const failed=context.spotProgressMarkup({status:'failed',mode:'EXHAUSTIVE',evaluated:0,stage:'fetching_spot',reason:'No data',progress:{fetching_spot:{status:'failed'},finalising_best_result:{status:'blocked'}}},true);
+ assert.match(failed,/Finalising Best Result<\/span><div class="prep-stage-result"><b>NOT RUN \/ BLOCKED/);assert.doesNotMatch(failed,/✓ Complete|aria-valuenow="100"/);
+ const fast=context.spotProgressMarkup({status:'running',mode:'FAST',stage:'evaluating_candidates',evaluationProgress:{completed:23,total:null}},true);assert.match(fast,/indeterminate/);assert.doesNotMatch(fast,/[0-9]+%/);
+ const exhaustive=context.spotProgressMarkup({status:'running',mode:'EXHAUSTIVE',stage:'evaluating_candidates',evaluationProgress:{completed:25,total:100}},true);assert.match(exhaustive,/25 \/ 100/);assert.match(exhaustive,/25\.00%/);
+ const best={expectancyR:1};context.renderSpotOpt({status:'cancelled',mode:'EXHAUSTIVE',evaluated:1,requested:2,bestResult:best,results:[]});assert.match(get('#spotOptBest').innerHTML,/BEST RESULT FOUND BEFORE INTERRUPTION/);assert.doesNotMatch(get('#spotOptBest').innerHTML,/BEST POSSIBLE/);
+});
+
+test("trade timestamp display uses the requested Indian date/time format",async()=>{
+ const {context}=await ui();
+ for(const [raw,display]of [
+  ["2026-10-01T11:47:00.000+05:30","01 Oct 2026, 11:47 AM"],
+  ["2026-09-28T14:39:00.000+05:30","28 Sep 2026, 02:39 PM"],
+  ["2026-09-24T15:13:00.000+05:30","24 Sep 2026, 03:13 PM"],
+  ["2026-09-17T09:28:00.000+05:30","17 Sep 2026, 09:28 AM"],
+  ["2026-10-01T12:01:00.000+05:30","01 Oct 2026, 12:01 PM"],
+  ["2026-10-01T06:17:00.000Z","01 Oct 2026, 11:47 AM"],
+  ["2026-09-30T18:30:00.000Z","01 Oct 2026, 12:00 AM"]
+ ])assert.equal(context.formatTradeTimestamp(raw),display);
+ for(const raw of [null,undefined,"","invalid timestamp"])assert.equal(context.formatTradeTimestamp(raw),raw);
+});
+test("spot trade rendering changes only the three timestamp displays without mutating source trades",async()=>{
+ const {context,get}=await ui();
+ const trade=Object.freeze({tradeNumber:1,date:"2026-10-01",direction:"BUY",signalType:"A",signalTimestamp:"2026-10-01T11:46:00.000+05:30",entryTimestamp:"2026-10-01T11:47:00.000+05:30",exitTimestamp:"2026-10-01T12:01:00.000+05:30",holdingMinutes:14,entryPrice:23000,sl:22980,target:23040,rr:2,outcome:"TARGET"});
+ const result=Object.freeze({summary:{},trades:Object.freeze([trade]),diagnostics:{historyRequests:{}}}),before=JSON.stringify(result);
+ get("#spotBackSummary").insertAdjacentHTML=()=>{};context.renderSpotBackResult(result);
+ const html=get("#spotTrades").innerHTML;
+ for(const text of ["01 Oct 2026, 11:46 AM","01 Oct 2026, 11:47 AM","01 Oct 2026, 12:01 PM"])assert.ok(html.includes(`<td>${text}</td>`));
+ for(const value of ["2026-10-01",14,23000,22980,23040,2,"TARGET"])assert.ok(html.includes(`<td>${value}</td>`));
+ assert.equal(JSON.stringify(result),before);
+});
+test("shared paginated tables format timestamp aliases and leave every other column unchanged",async()=>{
+ const {context,get}=await ui(),raw="2026-09-28T14:39:00.000+05:30";
+ const row=Object.freeze({signalTime:raw,entryTime:raw,exitTime:raw,signalTimestamp:raw,entryTimestamp:raw,exitTimestamp:raw,eventTime:raw,exitEventTime:raw,candleTimestamp:raw,holdingMinutes:12,pnl:123.45});
+ const rows=Object.freeze([row]),before=JSON.stringify(rows);context.pagedTable(get("#trades"),rows);
+ const html=get("#trades").innerHTML;assert.equal((html.match(/28 Sep 2026, 02:39 PM/g)||[]).length,6);assert.equal((html.match(/2026-09-28T14:39:00.000\+05:30/g)||[]).length,3);assert.match(html,/<td>12<\/td><td>123.45<\/td>/);assert.equal(JSON.stringify(rows),before);
 });

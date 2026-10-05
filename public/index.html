@@ -19,6 +19,8 @@
 <nav aria-label="Backtesting tools">
   <button type="button" class="tab active" data-tab="back">Backtesting</button>
   <button type="button" class="tab" data-tab="opt">Backtesting &amp; Optimisation</button>
+  <button type="button" class="tab" data-tab="spotBack">1-Minute Backtesting</button>
+  <button type="button" class="tab" data-tab="spotOpt">1-Minute Backtesting &amp; Optimisation</button>
 </nav>
 <main>
   <section id="back" class="panel active">
@@ -44,6 +46,21 @@
     <p id="retentionInfo" class="help-text"></p>
     <div id="resultControls" class="actions" hidden><button type="button" id="prevResults">Previous</button><span id="resultPage"></span><button type="button" id="nextResults">Next</button><a id="exportResults">Export stored results (NDJSON)</a></div>
     <div class="tableWrap"><table id="results"></table></div>
+  </section>
+  <section id="spotBack" class="panel">
+    <h2>1-Minute Backtesting</h2>
+    <p class="help-text">Spot-only strategy. Strategy and execution both use 1-minute NIFTY/BANKNIFTY spot candles. No options data is requested.</p>
+    <form id="spotBackForm"><div id="spotBackFields"></div><div class="actions"><button type="button" id="runSpotBack">Run Backtest</button><button type="button" id="cancelSpotBack" class="secondary" disabled>Cancel Backtest</button></div></form>
+    <div id="spotBackStatus" class="status-message" role="status" aria-live="polite"></div><div id="spotBackSummary"></div>
+    <p class="help-text">Intrabar ambiguity: when both Stop Loss and Target are touched within the same 1-minute candle, Stop Loss is assumed to occur first. The same conservative rule applies to a breakout candle.</p>
+    <p class="help-text">EOD exit leaves the consecutive-SL counter unchanged; TARGET resets it, SL increments it, and the counter resets each trading day. Unresolved trades close at the 15:14 candle close (15:15). Intrabar event timestamps use candle completion times, so holding times are minute-level estimates. EOD exits are excluded from resolved win/loss rates and expectancy. Signal counts include all qualifying candles; pending setups count only those accepted while flat and unblocked.</p>
+    <h3>Trade Ledger</h3><div class="tableWrap"><table id="spotTrades"></table></div>
+  </section>
+  <section id="spotOpt" class="panel">
+    <h2>1-Minute Backtesting &amp; Optimisation</h2>
+    <p class="help-text">Spot-only optimisation. Market data is prepared once and all candidates use the same 1-minute spot simulator as the backtest tab.</p>
+    <form id="spotOptForm"><div id="spotOptFields"></div><fieldset class="field-group"><legend>Optimisation</legend><div class="grid"><div class="field"><label for="spotMode">Optimisation Mode</label><select id="spotMode"><option value="FAST" selected>FAST — Non-exhaustive</option><option value="EXHAUSTIVE">EXHAUSTIVE — Every combination</option></select></div></div><p class="help-text">Rank by Expectancy R, then resolved target/SL trade count, then win rate, then lower EMA, slope, entry validity, RR, stop-distance threshold, and daily loss limit.</p><p id="spotOptWarning" class="warning-message" hidden></p><div class="actions"><button type="button" id="runSpotOpt">Run Optimisation</button><button type="button" id="cancelSpotOpt" class="secondary" disabled>Cancel Optimisation</button></div></fieldset></form>
+    <div id="spotOptStatus" class="status-message" role="status" aria-live="polite"></div><div id="spotOptBest"></div><h3>Candidate Results</h3><div class="tableWrap"><table id="spotOptResults"></table></div><div id="spotOptPages" class="actions"></div>
   </section>
 </main>
 </body>

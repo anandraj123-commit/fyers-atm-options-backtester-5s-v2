@@ -66,7 +66,7 @@ export async function get(path,params,token,options={}){
   const safe=Object.fromEntries(Object.entries(params).filter(([k])=>SAFE.has(k)));
   const context=`FYERS ${path}`;
   let r;
-  try {r=await fyersHistoryScheduler.request({endpoint:`GET ${DATA}${path}`,params:safe,token,purpose:options.purpose??"history",signal:options.signal,onState:options.onState,
+  try {r=await fyersHistoryScheduler.request({endpoint:`GET ${DATA}${path}`,params:safe,token,purpose:options.purpose??"history",signal:options.signal,onState:options.onState,diagnosticCounters:options.diagnosticCounters,
     cacheIf:body=>{if(path!=="/history"&&path!=="/history/fno/expired/historical-data")return true;try{parseCandles(body,params.resolution,{endpoint:`GET ${DATA}${path}`,symbol:params.symbol,resolution:params.resolution,date:params.range_from,params:safe,allowMalformedOutsideSession:path==="/history"&&String(params.resolution).endsWith("S")});return true;}catch{return false;}},
     run:async signal=>{
     const timeout=AbortSignal.timeout(30000),combined=AbortSignal.any([signal,timeout]);
