@@ -66,7 +66,7 @@ function backPreparationMarkup({status="preparing_data",message="",progress=null
  const activeId=progress?.activeStage;
  const stageText=titles.map(([id,name],index)=>{
   const item=all[id]??{},isActive=id===activeId,stageFailed=failed&&isActive||item.status==="failed",stageDone=complete||item.status==="complete";
-  const state=stageFailed?"✕ Failed":stageDone?"✓ Complete":item.status==="waiting_rate_limit"?"● Waiting before retry":item.status==="fetching"?"● Fetching...":item.status==="resolving"||item.status==="validating"?"● Resolving...":"○ Waiting";
+  const state=stageFailed?"✕ Failed":stageDone?"✓ Complete":item.status==="waiting_rate_limit"?`● Waiting before retry${Number.isFinite(item.retry)&&item.retry>0?` — next retry ${item.retry}/${item.maxRetries}`:item.phase==="initial_request"?" — first request pending":""}`:item.status==="retrying"?`● Retrying — ${item.retry}/${item.maxRetries}`:item.status==="waiting_pacing"?"● Waiting for request interval":item.status==="fetching"?"● Fetching...":item.status==="resolving"||item.status==="validating"?"● Resolving...":"○ Waiting";
   const cls=stageFailed?"failed":stageDone?"complete":isActive?"active":"waiting";
   const units=item.work??{};let detail="";
   const primary=units[id==="weekly_expiries"?"sessions":id==="option_contracts"?(units.contracts?.total!==null&&units.contracts?"contracts":units["expiry catalogs"]?"expiry catalogs":"contracts"):id==="option_premiums"?"histories":"chunks"];
@@ -80,7 +80,7 @@ function backPreparationMarkup({status="preparing_data",message="",progress=null
   return `<li class="prep-stage prep-stage-${cls}"><span>${escapeHtml(name)}${activity}</span><div class="prep-stage-result"><b>${state}</b>${detail?`<small>${escapeHtml(detail)}</small>`:""}</div></li>`;
  }).join("");
  const overall=complete?100:Number.isFinite(progress?.overallPercentage)?progress.overallPercentage:null;
- const activity=failed?"":waiting?`Waiting before retry...${wait?` Retry ${wait.retry}/${wait.maxRetries}; cooldown ${Math.ceil(wait.waitMs/1000)}s.`:""} ${progress?.currentActivity??message}`:progress?.currentActivity??message;
+ const activity=failed?"":waiting?`Waiting for FYERS cooldown...${wait?(wait.retry>0?` Next retry ${wait.retry}/${wait.maxRetries}.`:" First request pending; no retry used yet.")+` Cooldown ${Math.ceil(wait.waitMs/1000)}s.`:""} ${progress?.currentActivity??message}`:progress?.currentActivity??message;
  return `<section class="prep-progress ${failed?"is-failed":complete?"is-complete":"is-active"}" aria-label="Market data preparation" aria-live="polite"><h3>${failed?"MARKET DATA PREPARATION FAILED":complete?"MARKET DATA READY":"PREPARING MARKET DATA"}</h3><div class="prep-overall-label">Overall Progress <b>${overall===null?"—":`${overall}%`}</b></div><div class="prep-progress-track" role="progressbar" aria-label="Overall market data preparation progress" aria-valuemin="0" ${overall===null?'aria-valuetext="Working — overall total work is not yet measurable."':`aria-valuemax="100" aria-valuenow="${overall}"`}><span class="prep-progress-fill ${overall===null?"indeterminate":"determinate"}" ${overall!==null?`style="width:${overall}%"`:""}></span></div>${overall===null?'<div class="prep-progress-caption">Overall total work is not yet measurable.</div>':""}${activity?`<p class="prep-activity">${escapeHtml(activity)}</p>`:""}<ul class="prep-stages">${stageText}</ul>${error?`<pre class="prep-error">${escapeHtml(error)}</pre>`:""}</section>`;
 }
 async function runBacktest(context={}){

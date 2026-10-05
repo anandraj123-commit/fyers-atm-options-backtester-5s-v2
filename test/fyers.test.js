@@ -1,7 +1,7 @@
 import test,{beforeEach} from "node:test";
 import assert from "node:assert/strict";
 import {get,history,historyRequest,expiredHistory,expiredSymbols,expiryDates,optionChain,parseCandles,exchangeAuthCode,historyRequestDiagnostics,resetHistoryRequestDiagnostics} from "../src/fyers.js";
-import {HistoryRequestScheduler} from "../src/history-scheduler.js";
+import {HistoryRequestScheduler,fyersHistoryScheduler} from "../src/history-scheduler.js";
 import {sessionDateEpoch,ymdIST,hmIST,addDays} from "../src/time.js";
 process.env.FYERS_APP_ID="TEST-100";process.env.FYERS_SECRET_KEY="TEST_SECRET";process.env.FYERS_REDIRECT_URI="http://127.0.0.1:3000/api/fyers/callback";
 beforeEach(()=>resetHistoryRequestDiagnostics());
@@ -94,6 +94,41 @@ test("cancellation interrupts Retry-After wait",async()=>{
  const scheduler=new HistoryRequestScheduler({maxConcurrent:1,maxRetries:2,logger:{info(){}}}),controller=new AbortController();let calls=0;
  const pending=scheduler.request({endpoint:"GET /data/history",params:{},token:"T",signal:controller.signal,onState:()=>controller.abort(),run:async()=>{calls++;return new Response("{}",{status:429,headers:{"Retry-After":"30"}});}});
  await assert.rejects(pending,/cancelled/);assert.equal(calls,1);
+});
+test("5xx response schedules retry 1, then retry starts and succeeds with scheduler cleanup",async()=>{
+ const waits=[],states=[],scheduler=new HistoryRequestScheduler({maxConcurrent:1,maxRetries:2,minIntervalMs:0,baseDelayMs:10,random:()=>0,delay:async ms=>waits.push(ms),logger:{info(){}}});let calls=0;
+ const result=await scheduler.request({endpoint:"GET /data/history",params:{symbol:"NSE:NIFTY50-INDEX",resolution:"5S",range_from:"2026-01-26",range_to:"2026-01-30"},purpose:"execution_spot chunk 6/6",token:"PRIVATE",onState:s=>states.push(s),run:async()=>++calls===1?new Response(JSON.stringify({s:"error",code:500,message:"temporary server error"}),{status:500}):new Response(JSON.stringify({s:"ok",candles:[]}))});
+ assert.equal(calls,2);assert.equal(result.status,200);assert.deepEqual(waits,[8]);assert.ok(states.some(s=>s.status==="waiting_rate_limit"&&s.retry===1&&s.reason==="http_5xx"));assert.ok(states.some(s=>s.status==="retrying"&&s.retry===1));
+ await new Promise(resolve=>setImmediate(resolve));assert.equal(scheduler.active,0);assert.equal(scheduler.inflight.size,0);
+});
+test("network timeout/failure is bounded and retries; retry promise settles and dedup entry is removed",async()=>{
+ const states=[],scheduler=new HistoryRequestScheduler({maxConcurrent:1,maxRetries:2,minIntervalMs:0,baseDelayMs:1,random:()=>0,delay:async()=>{},logger:{info(){}}});let calls=0;
+ const result=await scheduler.request({endpoint:"GET /data/history",params:{symbol:"A",resolution:"5S"},token:"T",onState:s=>states.push(s),run:async()=>{calls++;if(calls===1)throw Object.assign(new Error("timeout"),{name:"TimeoutError",code:"TIMEOUT_ERR"});return new Response(JSON.stringify({s:"ok",candles:[]}));}});
+ assert.equal(result.status,200);assert.equal(calls,2);assert.ok(states.some(s=>s.status==="waiting_rate_limit"&&s.reason==="network_failure"&&s.errorName==="TimeoutError"));await new Promise(resolve=>setImmediate(resolve));assert.equal(scheduler.inflight.size,0);assert.equal(scheduler.active,0);
+});
+test("second retry failure terminates after bounded attempts and releases scheduler slot",async()=>{
+ const states=[],scheduler=new HistoryRequestScheduler({maxConcurrent:1,maxRetries:2,minIntervalMs:0,baseDelayMs:0,random:()=>0,delay:async()=>{},logger:{info(){}}});let calls=0;
+ const result=await scheduler.request({endpoint:"GET /data/history",params:{symbol:"A",resolution:"5S"},token:"T",onState:s=>states.push(s),run:async()=>{calls++;return new Response(JSON.stringify({s:"error",code:503,message:"temporary"}),{status:503});}});
+ assert.equal(result.status,503);assert.equal(calls,3);assert.equal(states.filter(s=>s.status==="retrying").length,2);await new Promise(resolve=>setImmediate(resolve));assert.equal(scheduler.active,0);assert.equal(scheduler.inflight.size,0);
+});
+test("deterministic HTTP 422 is not retried and in-flight state is cleaned",async()=>{
+ const scheduler=new HistoryRequestScheduler({maxConcurrent:1,maxRetries:2,minIntervalMs:0,delay:async()=>{},logger:{info(){}}});let calls=0;
+ const result=await scheduler.request({endpoint:"GET /data/history",params:{symbol:"A",resolution:"5S"},token:"T",run:async()=>{calls++;return new Response(JSON.stringify({s:"error",code:422,message:"invalid range"}),{status:422});}});
+ assert.equal(result.status,422);assert.equal(calls,1);await new Promise(resolve=>setImmediate(resolve));assert.equal(scheduler.inflight.size,0);assert.equal(scheduler.active,0);
+});
+test("minimum request spacing is progress pacing, never Retry 0/2",async()=>{
+ const scheduler=new HistoryRequestScheduler({maxConcurrent:1,maxRetries:2,minIntervalMs:10,logger:{info(){}}}),states=[];
+ const request=params=>scheduler.request({endpoint:"GET /data/history",params,token:"T",onState:s=>states.push(s),run:async()=>new Response(JSON.stringify({s:"ok",candles:[]}))});
+ await request({symbol:"A",resolution:"1"});await request({symbol:"B",resolution:"1"});
+ assert.ok(states.some(s=>s.status==="waiting_pacing"&&s.reason==="minimum_interval"));assert.ok(!states.some(s=>s.status==="waiting_rate_limit"&&s.retry===0));
+});
+test("5S six-chunk progress stays at five until final chunk retries and validates",async t=>{
+ let calls=0;mock(t,async()=>{calls++;if(calls===6)return new Response(JSON.stringify({s:"error",code:503,message:"temporary"}),{status:503});return new Response(JSON.stringify({s:"ok",candles:[[sessionDateEpoch("2026-01-26","09:15"),24850,24855,24845,24852,0]]}));});
+ const schedulerInterval=fyersHistoryScheduler.minIntervalMs;fyersHistoryScheduler.minIntervalMs=0;
+ try{
+  const events=[];const candles=await history("CHUNK6_TEST","NSE:NIFTY50-INDEX","5S","2026-01-01","2026-01-30",{purpose:"mandatory underlying execution 5S",onPreparationProgress:e=>events.push(e)});
+  assert.equal(calls,7);assert.equal(candles.length,6);assert.ok(events.some(e=>e.stage==="execution_spot"&&e.status==="waiting_rate_limit"&&e.completed===5&&e.total===6&&e.retry===1));assert.ok(events.some(e=>e.stage==="execution_spot"&&e.status==="retrying"&&e.completed===5&&e.total===6));assert.ok(events.some(e=>e.stage==="execution_spot"&&e.status==="complete"&&e.completed===6&&e.total===6));
+ }finally{fyersHistoryScheduler.minIntervalMs=schedulerInterval;}
 });
 test("candle schema, resolution, null values, duplicates validated",()=>{
  assert.throws(()=>parseCandles({resolution:"1",candles:[]},"5S"),/refusing/);

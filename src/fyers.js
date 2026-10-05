@@ -71,11 +71,12 @@ export async function get(path,params,token,options={}){
     run:async signal=>{
     const timeout=AbortSignal.timeout(30000),combined=AbortSignal.any([signal,timeout]);
     try{return await fetch(`${DATA}${path}?${new URLSearchParams(safe)}`,{headers:{Authorization:`${appId}:${token}`},signal:combined});}
-    catch(error){if(signal.aborted)throw error;throw new Error(`${context} network failure (HTTP unavailable); params=${JSON.stringify(safe)}`);}
+    catch(error){if(signal.aborted)throw error;if(timeout.aborted){const timedOut=new Error(`${context} request timed out after 30000ms; params=${JSON.stringify(safe)}`);timedOut.name="TimeoutError";timedOut.code="FYERS_HISTORY_TIMEOUT";throw timedOut;}throw new Error(`${context} network failure (HTTP unavailable); params=${JSON.stringify(safe)}`);}
   }});}
   catch(error){if(error.name==="AbortError"||error.code==="ABORT_ERR")throw error;throw error;}
   const j=r.body;
   if(!j||typeof j!=="object")throw new Error(`FYERS API ERROR: ${context} returned an invalid response object; params=${JSON.stringify(safe)}`);
+  if(process.env.NODE_ENV==="development")console.info(`[FYERS history] api_result ${JSON.stringify({endpoint:context,params:safe,purpose:options.purpose??"history",httpStatus:r.status,fyersStatus:j.s??null,fyersCode:j.code??null,fyersMessage:redact(j.message??"",[token])||null})}`);
   // Expiry/contract diagnostics contain market metadata and safe request fields
   // only. They intentionally omit response bodies and all authentication data.
   const expiryRows=j.data?.expiry_dates?.options,activeExpiryRows=j.data?.expiryData,contractRows=j.data?.contracts?.options,activeContractRows=j.data?.optionsChain;
@@ -186,7 +187,7 @@ export async function history(token,symbol,resolution,from,to,options={}){
   const optionHistory=stage==="option_premiums";
   const total=Math.floor((Date.parse(to)-Date.parse(from))/86400000/days)+1;
   let completed=0,index=0;
-  const report=(status,activity)=>options.onPreparationProgress?.({stage,status,completed:optionHistory?undefined:completed,total:optionHistory?null:total,unit:optionHistory?"histories":"chunks",activity});
+  const report=(status,activity,details={})=>options.onPreparationProgress?.({stage,status,completed:optionHistory?undefined:completed,total:optionHistory?null:total,unit:optionHistory?"histories":"chunks",activity,...details});
   report("fetching",optionHistory?`Fetching historical option premium — ${symbol}`:`Preparing ${stage==="execution_spot"?"5-second":"1-minute"} spot data`);
   for(let d=from;d<=to;d=addDays(d,days)){
     const chunkIndex=++index;
@@ -196,8 +197,14 @@ export async function history(token,symbol,resolution,from,to,options={}){
     const activity=optionHistory?`Fetching historical option premium — ${symbol} — ${chunkIndex} / ${total} request chunk(s)`:`Fetching ${stage==="execution_spot"?"5-second":"1-minute"} spot data — chunk ${chunkIndex} / ${total} (${d} → ${end})`;
     report("fetching",activity);
     try{
-      const requestState=state=>{options.onState?.(state);if(state.status==="waiting_rate_limit")report("waiting_rate_limit",`${activity}; waiting before retry ${state.retry}/${state.maxRetries}`);else if(state.status==="requesting")report("fetching",activity);};
-      const candles=parseCandles(await get("/history",params,token,{...options,onState:requestState,purpose:options.purpose??`underlying ${resolution}`} ),resolution,{endpoint:"GET /data/history",symbol,resolution,date:d,params,token,
+      const requestState=state=>{
+        options.onState?.(state);
+        if(state.status==="waiting_rate_limit")report("waiting_rate_limit",state.phase==="initial_request"?`${activity}; waiting for shared FYERS cooldown before first request`:`${activity}; waiting before retry ${state.retry}/${state.maxRetries}`,state);
+        else if(state.status==="waiting_pacing")report("waiting_pacing",`${activity}; waiting for minimum request interval (${Math.ceil(state.waitMs/1000)}s)`,state);
+        else if(state.status==="retrying")report("retrying",`${activity}; retrying ${state.retry}/${state.maxRetries}`,state);
+        else if(state.status==="requesting")report("fetching",activity);
+      };
+      const candles=parseCandles(await get("/history",params,token,{...options,onState:requestState,purpose:`${options.purpose??`underlying ${resolution}`} ${stage} chunk ${chunkIndex}/${total}`} ),resolution,{endpoint:"GET /data/history",symbol,resolution,date:d,params,token,
         allowMalformedOutsideSession:String(resolution).endsWith("S"),onInvalidOutsideSession});
       out.push(...candles);
       if(!optionHistory)completed++;

@@ -41,12 +41,14 @@ test("HTTP optimisation start/progress/cancel endpoints remain responsive",async
  await post(base+`/api/optimise/${id}/cancel`,{});const done=await(await fetch(base+`/api/optimise/${id}`)).json();assert.equal(done.status,"cancelled");assert.equal(done.exhaustive,false);finish();
 });
 test("backtest status exposes live stage units and percentages without changing data work",{timeout:5000},async t=>{
- let report,release;const base=await server(t,{token:"PRIVATE",backtest:async(_token,_cfg,options)=>{report=options.onPreparationProgress;report({stage:"execution_spot",status:"fetching",completed:0,total:20,unit:"chunks",activity:"Fetching 5-second NIFTY spot data — chunk 1 / 20"});return new Promise(resolve=>{release=()=>resolve({summary:{trades:0},trades:[],skipped:[]});});}});
+ let report,notify,release;const base=await server(t,{token:"PRIVATE",backtest:async(_token,_cfg,options)=>{report=options.onPreparationProgress;notify=options.onDataStatus;report({stage:"execution_spot",status:"fetching",completed:0,total:20,unit:"chunks",activity:"Fetching 5-second NIFTY spot data — chunk 1 / 20"});return new Promise(resolve=>{release=()=>resolve({summary:{trades:0},trades:[],skipped:[]});});}});
  const pending=post(base+"/api/backtest",cfg);let status;
  try{
   for(let i=0;i<30;i++){status=await(await fetch(base+"/api/status")).json();if(status.marketDataProgress?.stages?.execution_spot)break;await new Promise(r=>setTimeout(r,10));}
   assert.equal(status.marketDataProgress.status,"preparing_data");assert.equal(status.marketDataProgress.stages.execution_spot.percentage,0);assert.equal(status.marketDataProgress.stages.execution_spot.completed,0);
   for(const [completed,percentage]of [[1,5],[10,50],[19,95],[20,100]]){report({stage:"execution_spot",status:completed===20?"complete":"fetching",completed,total:20,unit:"chunks",activity:`${completed} of 20`});status=await(await fetch(base+"/api/status")).json();assert.equal(status.marketDataProgress.stages.execution_spot.percentage,percentage);assert.equal(status.marketDataProgress.stages.execution_spot.completed,completed);}
+  const retryAt=Date.now()+2500;report({stage:"execution_spot",status:"waiting_rate_limit",completed:5,total:6,unit:"chunks",retry:1,maxRetries:2,retryScheduledAt:new Date(retryAt).toISOString(),activity:"Fetching chunk 6/6; waiting before retry 1/2"});notify?.({status:"waiting_rate_limit",retry:1,maxRetries:2,waitMs:2500,retryScheduledAt:new Date(retryAt).toISOString()});
+  const wait1=(await(await fetch(base+"/api/status")).json()).marketDataWait.waitMs;await new Promise(r=>setTimeout(r,200));const waitingStatus=await(await fetch(base+"/api/status")).json();assert.ok(waitingStatus.marketDataWait.waitMs<wait1);assert.equal(waitingStatus.marketDataProgress.stages.execution_spot.completed,5);assert.equal(waitingStatus.marketDataProgress.stages.execution_spot.percentage,83);
  }finally{release?.();}
  assert.equal((await pending).status,200);
 });

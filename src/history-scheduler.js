@@ -60,12 +60,20 @@ export class HistoryRequestScheduler {
     });
   }
   #log(data){if(process.env.NODE_ENV==="development")this.logger?.info?.(`[FYERS history] ${JSON.stringify(data)}`);}
+  #state(entry,state){
+    entry.onState?.(state);
+    this.#log({event:state.event??state.status,endpoint:entry.endpoint,params:entry.params,purpose:entry.purpose,...state});
+  }
   async #acquireSlot(entry,attempt,signal){
     for(;;){
       if(signal.aborted)throw abortError();
       if(this.cooldownPromise){await raceAbort(this.cooldownPromise,signal);continue;}
       const now=Date.now(),wait=Math.max(this.cooldownUntil,this.nextRequestAt)-now;
-      if(wait>0){entry.onState?.({status:"waiting_rate_limit",retry:attempt,maxRetries:this.maxRetries,waitMs:wait});await this.delay(wait,signal);continue;}
+      if(wait>0){
+        const reason=this.cooldownUntil>now?"global_cooldown":"minimum_interval";
+        this.#state(entry,{status:reason==="global_cooldown"?"waiting_rate_limit":"waiting_pacing",reason,phase:attempt===0?"initial_request":"retry",retry:attempt,maxRetries:this.maxRetries,waitMs:wait,scheduledAt:new Date(now+wait).toISOString()});
+        await this.delay(wait,signal);continue;
+      }
       // No await between this reservation and returning: concurrent workers
       // cannot claim the same global start time.
       this.nextRequestAt=Date.now()+this.minIntervalMs;return;
@@ -79,28 +87,35 @@ export class HistoryRequestScheduler {
       for(let attempt=0;;attempt++){
         if(signal.aborted)throw abortError();
         await this.#acquireSlot(entry,attempt,signal);
-        entry.onState?.({status:"requesting",attempt:attempt+1,maxRetries:this.maxRetries});
+        const startedAt=Date.now();
         const number=this.counters.networkRequests+1;this.counters.networkRequests++;this.counters.networkHistoryRequests++;
+        entry.networkRequestNumber=number;
+        this.#state(entry,{status:attempt?"retrying":"requesting",attempt:attempt+1,retry:attempt,maxRetries:this.maxRetries,request:number,requestStartedAt:new Date(startedAt).toISOString()});
         const resolution=String(params?.resolution??""),isOption=String(purpose).toLowerCase().includes("option premium");
         if(!isOption&&resolution==="1")this.counters.oneMinuteRequests++;if(!isOption&&resolution==="5S")this.counters.execution5sRequests++;
         if(String(endpoint).toLowerCase().includes("expiry")||/expiry|contract/i.test(String(purpose)))this.counters.expiryRequests++;
         if(isOption)this.counters.optionHistoryRequests++;
         this.#log({event:"network_attempt",request:number,endpoint,params,purpose,attempt:attempt+1});
-        try{response=await run(signal);}catch(error){if(signal.aborted)throw abortError();throw error;}
-        this.#log({event:"response",request:number,endpoint,params,purpose,status:response.status});
-        if(response.status!==429)break;
-        this.counters.rateLimitResponses++;
-        const header=retryAfterMs(response.headers?.get?.("retry-after"));
+        try{response=await run(signal);}catch(error){
+          if(signal.aborted)throw abortError();
+          const responseAt=Date.now(),elapsedMs=responseAt-startedAt;
+          if(attempt>=this.maxRetries){this.#state(entry,{event:"request_failed",status:"failed",attempt:attempt+1,retryable:true,request:number,requestStartedAt:new Date(startedAt).toISOString(),responseAt:new Date(responseAt).toISOString(),elapsedMs,errorName:String(error?.name??"Error"),errorCode:String(error?.code??"").slice(0,40)});throw error;}
+          const waitMs=Math.round(this.baseDelayMs*2**attempt*(0.75+this.random()*0.5));
+          await this.#scheduleRetry(entry,{attempt,waitMs,reason:"network_failure",startedAt,responseAt,elapsedMs,request:number,errorName:String(error?.name??"Error"),errorCode:String(error?.code??"").slice(0,40),signal});
+          continue;
+        }
+        const responseAt=Date.now(),elapsedMs=responseAt-startedAt;
+        const retryable=response.status===429||response.status>=500;
+        this.#state(entry,{event:"response",status:"response",attempt:attempt+1,request:number,requestStartedAt:new Date(startedAt).toISOString(),responseAt:new Date(responseAt).toISOString(),elapsedMs,httpStatus:response.status,retryable});
+        if(response.status===429)this.counters.rateLimitResponses++;
+        if(!retryable||attempt>=this.maxRetries)break;
+        const header=response.status===429?retryAfterMs(response.headers?.get?.("retry-after")):null;
         const waitMs=header??Math.round(this.baseDelayMs*2**attempt*(0.75+this.random()*0.5));
-        this.cooldownUntil=Math.max(this.cooldownUntil,Date.now()+waitMs);
-        if(attempt>=this.maxRetries)break;
-        this.counters.retries++;
-        const pause=this.delay(waitMs);this.cooldownPromise=pause;
-        pause.finally(()=>{if(this.cooldownPromise===pause){this.cooldownPromise=null;this.cooldownUntil=0;}}).catch(()=>{});
-        this.#log({event:"rate_limited",request:number,endpoint,params,purpose,retry:attempt+1,maxRetries:this.maxRetries,retryAfterMs:header,waitMs});
-        entry.onState?.({status:"waiting_rate_limit",retry:attempt+1,maxRetries:this.maxRetries,waitMs});
-        // One global pause gates both this retry and every other queued worker.
-        await raceAbort(pause,signal);
+        // Cancel the retryable response body without yielding before publishing
+        // the global cooldown. Otherwise another queued worker can slip into
+        // the scheduler during this await and bypass the 429 pause.
+        try{void response.body?.cancel().catch(()=>{});}catch{}
+        await this.#scheduleRetry(entry,{attempt,waitMs,reason:response.status===429?"http_429":"http_5xx",startedAt,responseAt,elapsedMs,httpStatus:response.status,retryAfterMs:header,signal});
       }
       let result;try{result=await response.json();}catch{throw new Error(`${endpoint} returned non-JSON (HTTP ${response.status}); params=${JSON.stringify(params)}`);}
       const payload={status:response.status,ok:response.ok,body:result};
@@ -111,6 +126,15 @@ export class HistoryRequestScheduler {
       entry.resolve(payload);
     }catch(error){entry.reject(error);}
     finally{this.inflight.delete(identity);}
+  }
+  async #scheduleRetry(entry,{attempt,waitMs,reason,startedAt,responseAt,elapsedMs,httpStatus,retryAfterMs:retryAfter,request,errorName,errorCode,signal}){
+    const retry=attempt+1,scheduledAt=Date.now()+waitMs;
+    this.counters.retries++;
+    this.cooldownUntil=Math.max(this.cooldownUntil,scheduledAt);
+    const pause=this.delay(Math.max(0,this.cooldownUntil-Date.now()));this.cooldownPromise=pause;
+    pause.finally(()=>{if(this.cooldownPromise===pause){this.cooldownPromise=null;this.cooldownUntil=0;}}).catch(()=>{});
+    this.#state(entry,{event:"retry_scheduled",status:"waiting_rate_limit",reason,retry,maxRetries:this.maxRetries,request,requestStartedAt:new Date(startedAt).toISOString(),responseAt:new Date(responseAt).toISOString(),elapsedMs,httpStatus,retryAfterMs:retryAfter??null,cooldownMs:waitMs,retryScheduledAt:new Date(scheduledAt).toISOString(),retryable:true,...(errorName?{errorName,errorCode}:{})});
+    await raceAbort(pause,signal);
   }
 }
 
