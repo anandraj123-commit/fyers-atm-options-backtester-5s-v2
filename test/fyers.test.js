@@ -34,6 +34,21 @@ test("expiry response diagnostics retain safe endpoint/status/record counts",asy
  assert.equal(diagnostics[0].httpStatus,200);assert.equal(diagnostics[0].fyersCode,0);assert.equal(diagnostics[0].rawExpiryRecords,2);assert.equal(diagnostics[0].params.range_from,"2026-09-10");
  assert.doesNotMatch(JSON.stringify(diagnostics),/PRIVATE_EXPIRY_TOKEN|Authorization|secret/i);
 });
+test("expired option history exposes safe HTTP, FYERS, raw and parsed candle diagnostics",async t=>{
+ const ts=sessionDateEpoch("2026-09-11","09:16"),calls=[];mock(t,async url=>{calls.push(new URL(url));return new Response(JSON.stringify({s:"ok",code:0,message:"Success",candles:[[ts,10,11,9,10,0],[ts+60,11,12,10,11,1]]}),{status:200});});
+ const diagnostics=[],rows=await expiredHistory("OPTION_DIAG_TOKEN","NSE:NIFTY2691523300PE","1","2026-09-11","2026-09-11",{tradeContext:{tradeDate:"2026-09-11",expiryDate:"2026-09-15",strike:23300,optionType:"PE",underlyingSpotAtBreakout:23304,breakoutTimestamp:ts,requiredEntryTimestamp:ts+5},onPremiumDiagnostic:d=>diagnostics.push(d)});
+ const d=diagnostics.at(-1),url=calls[0];assert.equal(rows.length,2);assert.equal(d.endpoint,"GET https://api-t1.fyers.in/data/history/fno/expired/historical-data");assert.equal(d.params.symbol,"NSE:NIFTY2691523300PE");assert.equal(d.params.resolution,"1");assert.equal(d.params.range_from,"2026-09-11");assert.equal(d.params.range_to,"2026-09-11");assert.equal(d.params.date_format,1);assert.equal(d.params.include_oi,0);assert.equal(d.params.include_greeks,0);assert.equal(d.httpStatus,200);assert.equal(d.fyersCode,0);assert.equal(d.rawCandleCount,2);assert.equal(d.parsedCandleCount,2);assert.equal(d.firstRawCandleTimestamp,ts);assert.equal(d.lastParsedCandleTimestamp,ts+60);assert.equal(url.pathname,"/data/history/fno/expired/historical-data");assert.doesNotMatch(JSON.stringify(diagnostics),/OPTION_DIAG_TOKEN|Authorization|TEST_SECRET/);
+});
+test("expired option history diagnostics preserve FYERS error and malformed raw candle details",async t=>{
+ const diagnostics=[];mock(t,async()=>new Response(JSON.stringify({s:"error",code:-50,message:"invalid historical input",candles:[[1,2,3,1,2,1]]}),{status:422}));
+ await assert.rejects(expiredHistory("OPTION_ERROR_TOKEN","NSE:NIFTY2691523300PE","1","2026-09-11","2026-09-11",{tradeContext:{tradeDate:"2026-09-11",expiryDate:"2026-09-15",strike:23300,optionType:"PE",breakoutTimestamp:100,requiredEntryTimestamp:105},onPremiumDiagnostic:d=>diagnostics.push(d)}),/HTTP 422/);
+ assert.equal(diagnostics.length,1);assert.equal(diagnostics[0].httpStatus,422);assert.equal(diagnostics[0].fyersCode,-50);assert.match(diagnostics[0].fyersMessage,/invalid historical input/);assert.equal(diagnostics[0].rawCandleCount,1);assert.equal(diagnostics[0].parsedCandleCount,null);assert.match(diagnostics[0].failureReason,/FYERS API ERROR/);assert.doesNotMatch(JSON.stringify(diagnostics),/OPTION_ERROR_TOKEN|Authorization/);
+});
+test("expired option history parser rejection retains response status and raw candle timestamps",async t=>{
+ const ts=sessionDateEpoch("2026-09-11","09:16"),diagnostics=[];mock(t,async()=>new Response(JSON.stringify({s:"ok",code:0,candles:[[ts,10,8,9,10,1]]}),{status:200}));
+ await assert.rejects(expiredHistory("PARSE_DIAG_TOKEN","NSE:NIFTY2691523300PE","1","2026-09-11","2026-09-11",{tradeContext:{tradeDate:"2026-09-11",expiryDate:"2026-09-15",strike:23300,optionType:"PE",breakoutTimestamp:ts,requiredEntryTimestamp:ts+5},onPremiumDiagnostic:d=>diagnostics.push(d)}),/INVALID FYERS CANDLE/);
+ const d=diagnostics.at(-1);assert.equal(d.httpStatus,200);assert.equal(d.rawCandleCount,1);assert.equal(d.parsedCandleCount,null);assert.equal(d.firstRawCandleTimestamp,ts);assert.match(d.failureReason,/INVALID FYERS CANDLE/);assert.doesNotMatch(JSON.stringify(diagnostics),/PARSE_DIAG_TOKEN|Authorization/);
+});
 test("history ranges chunk: minute <=100 days; seconds bounded multi-day ranges, never fallback",async t=>{
  const calls=[];mock(t,async url=>{calls.push(new URL(url));return new Response(JSON.stringify({s:"ok",candles:[]}));});
  await history("T","NSE:NIFTY50-INDEX","1","2026-01-01","2026-04-15");assert.equal(calls.length,2);assert.equal(calls[0].searchParams.get("range_to"),"2026-04-10");

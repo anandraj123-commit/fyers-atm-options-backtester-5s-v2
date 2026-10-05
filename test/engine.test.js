@@ -20,6 +20,8 @@ test("backtest progress reports actual ATM contract and validated premium histor
  assert.ok(events.some(x=>x.stage==="option_premiums"&&x.unit==="histories"&&x.completed===0&&x.total===null&&x.status==="fetching"));
  assert.deepEqual(events.filter(x=>x.stage==="option_contracts"&&x.status==="complete").map(x=>[x.completed,x.total]),[[1,1]]);
  assert.deepEqual(events.filter(x=>x.stage==="option_premiums"&&x.status==="complete").map(x=>[x.completed,x.total]),[[1,1]]);
+ assert.ok(events.some(x=>x.stage==="running_backtest"&&x.status==="processing"&&x.total>0));
+ assert.deepEqual(events.filter(x=>x.stage==="running_backtest"&&x.status==="complete").map(x=>[x.completed,x.total]),[[events.find(x=>x.stage==="running_backtest"&&x.status==="complete").total,events.find(x=>x.stage==="running_backtest"&&x.status==="complete").total]]);
 });
 for(const sell of [false,true])test(`strict ${sell?"SELL <":"BUY >"} breakout, equality never triggers`,()=>{
  const f=fixture({sell,target:false});
@@ -57,8 +59,9 @@ test("no historical lot-size fallback; missing required metadata stops the backt
 test("missing ATM contract or required option premium after a confirmed breakout is incomplete market data",async()=>{
  const missingContract=fixture().data;missingContract.contractsByExpiry.set("2026-09-22",[]);
  await assert.rejects(simulate(missingContract,cfg),error=>error.incompleteData===true&&error.pipelineCounters.entriesRequiringOptions===1&&/actual ATM CE weekly contract unavailable/.test(error.message));
- const missingPremium=fixture().data;missingPremium.getOptions=async()=>[];
- await assert.rejects(simulate(missingPremium,cfg),error=>error.incompleteData===true&&error.pipelineCounters.optionContractsResolved===1&&error.pipelineCounters.optionPremiumHistoriesLoaded===1&&/option premium data unavailable/.test(error.message));
+ const missingPremium=fixture().data;missingPremium.getOptions=async()=>[];const diagnostics=[];
+ await assert.rejects(simulate(missingPremium,cfg,{onOptionHistoryDiagnostic:d=>diagnostics.push(d)}),error=>error.incompleteData===true&&error.pipelineCounters.optionContractsResolved===1&&error.pipelineCounters.optionPremiumHistoriesLoaded===1&&/option entry premium unavailable/.test(error.message)&&/OPTION HISTORY DIAGNOSTIC/.test(error.message)&&/exactEntryMatch: NO/.test(error.message));
+ assert.equal(diagnostics.at(-1).rawCandleCount,null);assert.equal(diagnostics.at(-1).parsedCandleCount,0);assert.equal(diagnostics.at(-1).failureReason,"FYERS returned zero parsed option candles");assert.ok(diagnostics.at(-1).underlyingSpotAtBreakout>0);assert.equal(diagnostics.at(-1).atmSelectionRule,"Nearest actual FYERS contract strike by absolute spot distance; ties choose the lower strike");
 });
 test("09:15 start, weekdays only",async()=>{
  assert.equal(inSession(start-5),false);assert.equal(inSession(start),true);assert.equal(inSession(sessionDateEpoch("2026-09-26")),false);assert.equal(inSession(sessionDateEpoch("2026-09-27")),false);

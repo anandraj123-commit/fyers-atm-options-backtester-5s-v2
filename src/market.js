@@ -63,8 +63,9 @@ export function marketDataSummary(data,cfg){
     // expiries touched by an executed entry. A valid zero-signal run can still
     // have its weekly expiry infrastructure verified and counted here.
     resolvedExpiries:resolvedExpiryDates.size,weeklyExpiryDatesDiscovered:data.weeklyExpiryDatesDiscovered??0,
-    expiryDiagnostics:data.expiryDiagnostics??[],requiredOptionContracts:selectedContracts.size,
-    optionPremiumCandles:[...data.optionData.values()].reduce((n,rows)=>n+rows.length,0),historyRequests:historyRequestDiagnostics()};
+    expiryDiagnostics:data.expiryDiagnostics??[],requiredOptionContracts:selectedContracts.size,uniqueOptionContracts:selectedContracts.size,
+    optionContractSelectionEntries:data.contractSelections?.size??0,requiredOptionContractsMeaning:"unique selected contract symbols; not entry count or premium-history count",
+    optionPremiumHistoriesLoaded:data.optionData.size,optionPremiumCandles:[...data.optionData.values()].reduce((n,rows)=>n+rows.length,0),historyRequests:historyRequestDiagnostics()};
 }
 export function warmupStart(startDate,emaLength,slopeLookback,resolution){
   // Request only enough prior calendar to cover the required completed bars,
@@ -243,13 +244,15 @@ export async function prepareMarket(store,cfg,{maxEMA=cfg.emaLength,maxSlope=cfg
     expirySessionsCompleted++;
     onPreparationProgress({stage:"weekly_expiries",status:expirySessionsCompleted===activeDays.size?"complete":"resolving",completed:expirySessionsCompleted,total:activeDays.size,unit:"sessions",activity:`Resolving weekly expiry — session ${expirySessionsCompleted} / ${activeDays.size}: ${day}`});
   }
-  data.getOptions=async(contract,day)=>{
+  data.getOptions=async(contract,day,fetchContext={})=>{
     const key=`${contract.symbol}:${cfg.optionResolution}:${day}`;
     if(data.optionsPreparedForOptimization&&!data.optionData.has(key))throw new Error(`Optimisation candidate requested unprepared option history ${key}; candidate evaluation may not fetch FYERS data`);
     if(!data.optionData.has(key)){
       const load=contract.expiryDate>=today?store.activeOptions:store.options;
       if(typeof load!=="function")throw new Error(`FYERS ${contract.expiryDate>=today?"active":"expired"} option-history path is unavailable for ${contract.symbol}`);
-      data.optionData.set(key,await load(contract.symbol,cfg.optionResolution,day,day,{signal,onState:onDataStatus,purpose:`${contract.expiryDate>=today?"active":"expired"} option premium ${contract.symbol} ${day}`}));
+      data.optionData.set(key,await load(contract.symbol,cfg.optionResolution,day,day,{signal,onState:onDataStatus,onPremiumDiagnostic:fetchContext.onDiagnostic,
+        tradeContext:{tradeDate:day,expiryDate:contract.expiryDate,strike:contract.strike,optionType:contract.optionType,underlyingSpotAtBreakout:fetchContext.atmReferenceSpot,breakoutTimestamp:fetchContext.breakoutTimestamp,requiredEntryTimestamp:fetchContext.requiredEntryTimestamp},
+        purpose:`${contract.expiryDate>=today?"active":"expired"} option premium ${contract.symbol} ${day}`}));
     }
     return data.optionData.get(key);
   };

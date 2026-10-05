@@ -36,9 +36,10 @@ export function* combinations(plan){
     yield {emaLength:e.value(i),slopeLookback:s.value(j),entryValidCandles:v.value(k),rr:r.value(n),maxConsecutiveLosses:l.value(m),minStopLossDistancePct:d.value(p),expiryType:"WEEKLY"};
 }
 function* exhaustiveSearch(plan){for(const parameters of combinations(plan))yield {parameters,stage:"Exhaustive Search"};}
-async function prepareOptimizationOptions(data,cfg,plan,{check=()=>{},onProgress=()=>{}}={}){
+async function prepareOptimizationOptions(data,cfg,plan,{check=()=>{},onProgress=()=>{},onOptionHistoryDiagnostic=()=>{}}={}){
   const [emas,slopes,valid]=plan.dims,validity=valid.value(valid.count-1),minimum=plan.dims[5].value(0),seenPairs=emas.count*slopes.count;
-  let pair=0,required=0;
+  let pair=0,required=0;const resolvedContracts=new Set(),loadedHistories=new Set();
+  onProgress({stage:"preparing_optimisation",status:"processing",completed:0,total:seenPairs,unit:"EMA/slope pairs",activity:`Preparing optimisation signals — 0 / ${seenPairs} EMA/slope pairs`});
   for(let ei=0;ei<emas.count;ei++)for(let si=0;si<slopes.count;si++){
     check();const emaLength=emas.value(ei),slopeLookback=slopes.value(si),signalCfg={...cfg,emaLength,slopeLookback,entryValidCandles:validity,minStopLossDistancePct:minimum};
     for(const candidate of candidates(data,signalCfg)){
@@ -49,12 +50,17 @@ async function prepareOptimizationOptions(data,cfg,plan,{check=()=>{},onProgress
       const optionType=sig.side==="BUY"?"CE":"PE",contract=chooseATM(data.contractsByExpiry.get(expiry)||[],pending.trigger.spot,optionType,"WEEKLY");
       if(!contract)throw new Error(`Required actual ATM ${optionType} weekly contract unavailable for ${expiry} on ${day}`);
       if(!contract.lotSize)throw new Error(`Historical lot size unavailable for required contract ${contract.symbol} on ${day}. Safe contract metadata: ${JSON.stringify(contractLotDiagnostic(contract))}`);
-      const optionRows=await data.getOptions(contract,day),fill=optionRows.find(row=>row.t>=pending.trigger.t&&row.t<pending.end&&row.o>0&&row.v>0);
+      resolvedContracts.add(`${contract.symbol}:${day}`);onProgress({stage:"option_contracts",status:"resolving",completed:resolvedContracts.size,total:null,unit:"contracts",activity:`Resolving required ATM option contracts — ${resolvedContracts.size} resolved; total not yet known`});
+      const optionRows=await data.getOptions(contract,day,{breakoutTimestamp:pending.trigger.t,requiredEntryTimestamp:pending.trigger.t,onDiagnostic:onOptionHistoryDiagnostic});
+      const fill=optionRows.find(row=>row.t>=pending.trigger.t&&row.t<pending.end&&row.o>0&&row.v>0);
       if(!fill)throw new Error(`Required option entry premium unavailable after breakout for ${contract.symbol} on ${day}`);
+      loadedHistories.add(`${contract.symbol}:${day}`);onProgress({stage:"option_premiums",status:"fetching",completed:loadedHistories.size,total:null,unit:"histories",activity:`Fetching required option premium histories — ${loadedHistories.size} validated; total not yet known`});
       required++;
     }
-    if(++pair%10===0){onProgress(`Preparing required weekly option premiums (${pair}/${seenPairs} EMA/slope pairs)`);await new Promise(resolve=>setImmediate(resolve));}
+    pair++;if(pair%10===0||pair===seenPairs){onProgress({stage:"preparing_optimisation",status:pair===seenPairs?"complete":"processing",completed:pair,total:seenPairs,unit:"EMA/slope pairs",activity:`Preparing optimisation signals — ${pair} / ${seenPairs} EMA/slope pairs`});await new Promise(resolve=>setImmediate(resolve));}
   }
+  onProgress({stage:"option_contracts",status:"complete",completed:resolvedContracts.size,total:resolvedContracts.size,unit:"contracts",activity:`Required option contracts prepared — ${resolvedContracts.size} / ${resolvedContracts.size}`});
+  onProgress({stage:"option_premiums",status:"complete",completed:loadedHistories.size,total:loadedHistories.size,unit:"histories",activity:`Required option premium histories prepared — ${loadedHistories.size} / ${loadedHistories.size}`});
   data.optionsPreparedForOptimization=true;return required;
 }
 function coarseIndexes(count){return [...new Set(Array.from({length:Math.min(4,count)},(_,i)=>count===1?0:Math.round(i*(count-1)/(Math.min(4,count)-1))))];}
@@ -102,7 +108,8 @@ export async function optimise(token,input,options={}){
   if(!Number.isFinite(maxSeconds)||maxSeconds<=0||!Number.isSafeInteger(maxBytes)||maxBytes<0||!Number.isSafeInteger(cacheBudget)||cacheBudget<=0||!Number.isSafeInteger(fastLimit)||fastLimit<=0)throw new Error("Invalid optimisation server resource budgets");
   const state={status:"preparing_data",mode:cfg.mode,stage:"Preparing Market Data",objective:"MAXIMUM_NET_TOTAL_RETURN_PERCENTAGE",resolution:cfg.resolution,config:cfg,
     requested:plan.totalCombinations,dimensions:plan.dimensions,evaluated:0,storedResults:0,elapsed:0,progressPct:0,estimatedRemaining:null,
-    exhaustive:false,bestResult:null,unavailableCandidates:0,retentionLimited:false,fastCandidateBudget:cfg.mode==="FAST"?fastLimit:null};
+    exhaustive:false,bestResult:null,unavailableCandidates:0,retentionLimited:false,fastCandidateBudget:cfg.mode==="FAST"?fastLimit:null,preparationStages:{}};
+  const fastBroadTotal=plan.dims.reduce((n,d)=>n*Math.min(4,d.count),1);
   let store=null,storageFailed=false,finalized=false,evalMs=0,data;
   const progress=()=>{
     state.elapsed=(Date.now()-started)/1000;
@@ -123,17 +130,22 @@ export async function optimise(token,input,options={}){
   progress();
   try{
     try{store=options.resultStore??await createResultStore({maxBytes});options.onStore?.(store);}catch{storageFailure();}
-    data=options.data??await prepareMarket(options.store??marketStore(token),cfg,{maxEMA:cfg.emaMax,maxSlope:cfg.slopeMax,check,signal:options.signal,
-      onProgress:message=>{state.message=message;state.status="preparing_data";progress();},
-      onDataStatus:status=>{if(status.status==="waiting_rate_limit"){state.status="waiting_rate_limit";state.stage="Preparing Market Data";state.message=status.phase==="initial_request"?"FYERS shared cooldown. First market-data request is pending.":`FYERS rate limit. Waiting before retry ${status.retry}/${status.maxRetries}.`;progress();}else if(status.status==="waiting_pacing"){state.status="preparing_data";state.stage="Preparing Market Data";state.message="Respecting the minimum interval between FYERS history requests.";progress();}else if(status.status==="retrying"){state.status="preparing_data";state.stage="Preparing Market Data";state.message=`Retrying FYERS history request ${status.retry}/${status.maxRetries}.`;progress();}else if(status.status==="requesting"){state.status="preparing_data";state.stage="Preparing Market Data";delete state.message;progress();}}});
+    const updatePreparation=event=>{const old=state.preparationStages[event.stage]??{};const unit=event.unit??"units",work={...(old.work??{})};work[unit]={unit,completed:Number.isFinite(event.completed)?event.completed:work[unit]?.completed??0,total:event.total===undefined?work[unit]?.total??null:Number.isFinite(event.total)?event.total:null,percentage:Number.isFinite(event.total)&&event.total>0?Math.floor(event.completed/event.total*100):null};state.preparationStages[event.stage]={...old,...event,work};state.activePreparationStage=event.status==="complete"?null:event.stage;state.currentActivity=event.activity??state.currentActivity;state.stageProgress=state.preparationStages[event.stage];progress();};
+    data=options.data??await prepareMarket(options.store??marketStore(token),cfg,{maxEMA:cfg.emaMax,maxSlope:cfg.slopeMax,check,signal:options.signal,onPreparationProgress:updatePreparation,
+      onProgress:message=>{state.message=message;state.currentActivity=message;state.status="preparing_data";progress();},
+      onDataStatus:status=>{if(status.status==="waiting_rate_limit"){state.status="waiting_rate_limit";state.stage="Preparing Market Data";state.message=status.phase==="initial_request"?"FYERS shared cooldown. First market-data request is pending.":`FYERS rate limit. Waiting before retry ${status.retry}/${status.maxRetries}.`;state.currentActivity=state.message;progress();}else if(status.status==="waiting_pacing"){state.status="preparing_data";state.stage="Preparing Market Data";state.message="Respecting the minimum interval between FYERS history requests.";state.currentActivity=state.message;progress();}else if(status.status==="retrying"){state.status="preparing_data";state.stage="Preparing Market Data";state.message=`Retrying FYERS history request ${status.retry}/${status.maxRetries}.`;state.currentActivity=state.message;progress();}else if(status.status==="requesting"){state.status="preparing_data";state.stage="Preparing Market Data";state.currentActivity=state.stageProgress?.activity??"Fetching historical market data";delete state.message;progress();}}});
     data.cacheBudget=cacheBudget;state.marketData=marketDataSummary(data,cfg);delete state.message;
     state.status="preparing_data";state.stage="Preparing Required Weekly Option Premiums";progress();
-    state.requiredOptionCandidates=await prepareOptimizationOptions(data,cfg,plan,{check,onProgress:message=>{state.message=message;progress();}});
+    state.requiredOptionCandidates=await prepareOptimizationOptions(data,cfg,plan,{check,onOptionHistoryDiagnostic:options.onOptionHistoryDiagnostic,onProgress:event=>{updatePreparation(event);if(event.activity)state.message=event.activity;}});
     state.marketData=marketDataSummary(data,cfg);delete state.message;state.status="running";
     const search=cfg.mode==="FAST"?fastSearch(plan,fastLimit):exhaustiveSearch(plan);
     let next=search.next(),lastPublish=0;
     while(!next.done){
       check();state.status="running";state.stage=next.value.stage;
+      if(cfg.mode==="FAST"&&state.fastStageName!==next.value.stage){state.fastStageName=next.value.stage;state.fastStageEvaluated=0;}
+      state.currentActivity=cfg.mode==="FAST"?`Evaluating FAST optimisation — ${next.value.stage}`:`Evaluating EXHAUSTIVE optimisation — ${state.evaluated} / ${plan.totalCombinations} combinations`;
+      const evaluatedInStage=cfg.mode==="FAST"?state.fastStageEvaluated:state.evaluated,stageTotal=cfg.mode==="EXHAUSTIVE"?plan.totalCombinations:next.value.stage==="Broad Search"?fastBroadTotal:null;
+      state.evaluationProgress={stage:"evaluating_candidates",status:"processing",completed:evaluatedInStage,total:stageTotal,unit:"candidates",percentage:stageTotal>0?Math.floor(evaluatedInStage/stageTotal*10000)/100:null,activity:state.currentActivity};
       if(state.evaluated===0)progress();
       const parameters=next.value.parameters,tick=performance.now();
       const result=await (options.evaluate??simulate)(data,{...cfg,...parameters},{check});
@@ -144,6 +156,9 @@ export async function optimise(token,input,options={}){
         netPnl:result.summary.netPnl,totalCharges:result.summary.totalCharges,trades:result.summary.trades,pipelineCounters:result.pipelineCounters,skippedCount:result.skipped.length,ambiguousCount:result.summary.ambiguousCount,
         eligible:returnPct!==null,status:returnPct===null?"DATA_UNAVAILABLE":"EVALUATED",reason:result.skipped.find(x=>x.unavailable)?.reason??""};
       state.evaluated++;
+      if(cfg.mode==="FAST")state.fastStageEvaluated++;
+      const completedInStage=cfg.mode==="FAST"?state.fastStageEvaluated:state.evaluated;
+      state.evaluationProgress={stage:"evaluating_candidates",status:"processing",completed:completedInStage,total:stageTotal,unit:"candidates",percentage:stageTotal>0?Math.floor(completedInStage/stageTotal*10000)/100:null,activity:cfg.mode==="FAST"?`Evaluating FAST optimisation — ${next.value.stage} (${state.evaluated} candidates evaluated overall)`:`Evaluating EXHAUSTIVE optimisation — ${state.evaluated} / ${plan.totalCombinations} combinations`};
       if(!row.eligible)state.unavailableCandidates++;
       if(row.eligible&&(!state.bestResult||compareResults(row,state.bestResult)<0))state.bestResult=row;
       state.marketData=marketDataSummary(data,cfg);
@@ -157,6 +172,8 @@ export async function optimise(token,input,options={}){
     state.status="complete";
     state.exhaustive=cfg.mode==="EXHAUSTIVE"&&BigInt(state.evaluated)===plan.total;
     state.stage="Finished";
+    if(cfg.mode==="FAST")state.evaluationProgress={stage:"evaluating_candidates",status:"complete",completed:state.evaluated,total:state.evaluated,unit:"candidates",percentage:100,activity:`FAST search complete — ${state.evaluated} candidates evaluated`};
+    else state.evaluationProgress={stage:"evaluating_candidates",status:"complete",completed:state.evaluated,total:plan.totalCombinations,unit:"candidates",percentage:state.exhaustive?100:null,activity:`EXHAUSTIVE search complete — ${state.evaluated} / ${plan.totalCombinations} combinations`};
     if(cfg.mode==="FAST")state.reason=`FAST completed a deterministic non-exhaustive search (${state.evaluated} candidates). No global optimum is guaranteed.`;
   }catch(e){
     const preparing=state.status==="preparing_data"||state.status==="waiting_rate_limit";
@@ -166,9 +183,9 @@ export async function optimise(token,input,options={}){
   }
   if(data)state.cacheStats={...data.cacheStats,bytes:data.cacheBytes};
   if(store){
-    const terminalStage=state.stage;state.stage="Sorting Retained Results";state.sorting=true;progress();
+    const terminalStage=state.stage;state.stage="Finalising Best Result";state.finalisingProgress={stage:"finalising_result",status:"processing",completed:0,total:null,unit:"result finalisation",percentage:null,activity:"Finalising best optimisation result"};state.sorting=true;progress();
     try{await store.finalize(state.bestResult);finalized=true;}catch{storageFailure();}
-    state.sorting=false;state.stage=terminalStage;
+    state.sorting=false;state.stage=terminalStage;state.finalisingProgress={stage:"finalising_result",status:"complete",completed:1,total:1,unit:"result finalisation",percentage:100,activity:"Best result finalised"};
   }
   state.exportAvailable=!!store?.file;progress();
   return {...state,store};

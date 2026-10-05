@@ -80,8 +80,12 @@ export async function get(path,params,token,options={}){
   // Expiry/contract diagnostics contain market metadata and safe request fields
   // only. They intentionally omit response bodies and all authentication data.
   const expiryRows=j.data?.expiry_dates?.options,activeExpiryRows=j.data?.expiryData,contractRows=j.data?.contracts?.options,activeContractRows=j.data?.optionsChain;
+  const rawCandles=j.candles??j.data?.candles;
   options.onResponse?.({endpoint:`GET ${DATA}${path}`,params:safe,httpStatus:r.status,
     fyersCode:Number.isFinite(j.code)?j.code:null,fyersMessage:typeof j.message==="string"?redact(j.message,[token]):null,
+    rawCandleCount:Array.isArray(rawCandles)?rawCandles.length:null,
+    firstRawCandleTimestamp:Array.isArray(rawCandles?.[0])?rawCandles[0][0]??null:null,
+    lastRawCandleTimestamp:Array.isArray(rawCandles?.at(-1))?rawCandles.at(-1)[0]??null:null,
     rawExpiryRecords:Array.isArray(expiryRows)?expiryRows.length:Array.isArray(activeExpiryRows)?activeExpiryRows.length:null,
     rawContractRecords:Array.isArray(contractRows)?contractRows.length:Array.isArray(activeContractRows)?activeContractRows.length:null});
   if(!r.ok||j.s==="error"||(typeof j.code==="number"&&j.code<0)) {
@@ -188,11 +192,13 @@ export async function history(token,symbol,resolution,from,to,options={}){
   const total=Math.floor((Date.parse(to)-Date.parse(from))/86400000/days)+1;
   let completed=0,index=0;
   const report=(status,activity,details={})=>options.onPreparationProgress?.({stage,status,completed:optionHistory?undefined:completed,total:optionHistory?null:total,unit:optionHistory?"histories":"chunks",activity,...details});
+  const emitOptionDiagnostic=diagnostic=>{options.onPremiumDiagnostic?.(diagnostic);if(process.env.NODE_ENV==="development")console.info(`OPTION HISTORY DIAGNOSTIC\n${JSON.stringify(diagnostic,null,2)}`);};
   report("fetching",optionHistory?`Fetching historical option premium — ${symbol}`:`Preparing ${stage==="execution_spot"?"5-second":"1-minute"} spot data`);
   for(let d=from;d<=to;d=addDays(d,days)){
     const chunkIndex=++index;
     const end=addDays(d,days-1)<to?addDays(d,days-1):to;
     const params=historyRequest(symbol,resolution,d,end);
+    let responseMeta=null;
     const onInvalidOutsideSession=details=>{invalidOutsideSessionCount+=details.count;options.onInvalidOutsideSession?.(details);if(!options.onInvalidOutsideSession&&process.env.NODE_ENV!=="production")console.warn(`FYERS ignored ${details.count} malformed pre/post-session candle(s) outside the required trading window: ${JSON.stringify({endpoint:"GET /data/history",symbol,resolution,date:d,examples:details.examples})}`);};
     const activity=optionHistory?`Fetching historical option premium — ${symbol} — ${chunkIndex} / ${total} request chunk(s)`:`Fetching ${stage==="execution_spot"?"5-second":"1-minute"} spot data — chunk ${chunkIndex} / ${total} (${d} → ${end})`;
     report("fetching",activity);
@@ -204,12 +210,17 @@ export async function history(token,symbol,resolution,from,to,options={}){
         else if(state.status==="retrying")report("retrying",`${activity}; retrying ${state.retry}/${state.maxRetries}`,state);
         else if(state.status==="requesting")report("fetching",activity);
       };
-      const candles=parseCandles(await get("/history",params,token,{...options,onState:requestState,purpose:`${options.purpose??`underlying ${resolution}`} ${stage} chunk ${chunkIndex}/${total}`} ),resolution,{endpoint:"GET /data/history",symbol,resolution,date:d,params,token,
+      const body=await get("/history",params,token,{...options,onState:requestState,onResponse:meta=>{responseMeta=meta;options.onResponse?.(meta);},purpose:`${options.purpose??`underlying ${resolution}`} ${stage} chunk ${chunkIndex}/${total}`});
+      const candles=parseCandles(body,resolution,{endpoint:"GET /data/history",symbol,resolution,date:d,params,token,
         allowMalformedOutsideSession:String(resolution).endsWith("S"),onInvalidOutsideSession});
+      if(optionHistory){const context=options.tradeContext??{},diag={symbol,optionType:context.optionType??(/(CE|PE)$/.exec(symbol)?.[1]??null),strike:context.strike??null,expiryDate:context.expiryDate??null,tradeDate:context.tradeDate??d,underlyingSpotAtBreakout:context.underlyingSpotAtBreakout??null,
+        breakoutTimestamp:context.breakoutTimestamp??null,requiredEntryTimestamp:context.requiredEntryTimestamp??null,resolution,endpoint:"GET /data/history",params,httpStatus:responseMeta?.httpStatus??null,fyersCode:responseMeta?.fyersCode??null,fyersMessage:responseMeta?.fyersMessage??null,
+        rawCandleCount:responseMeta?.rawCandleCount??null,parsedCandleCount:candles.length,firstRawCandleTimestamp:responseMeta?.firstRawCandleTimestamp??null,lastRawCandleTimestamp:responseMeta?.lastRawCandleTimestamp??null,
+        firstParsedCandleTimestamp:candles[0]?.t??null,lastParsedCandleTimestamp:candles.at(-1)?.t??null,failureReason:null};Object.defineProperty(candles,"historyDiagnostic",{value:diag,enumerable:false});emitOptionDiagnostic(diag);}
       out.push(...candles);
       if(!optionHistory)completed++;
       report(chunkIndex===total&&!optionHistory?"complete":"fetching",optionHistory?activity:`${activity} — ${completed} / ${total} chunks`);
-    }catch(error){report("failed",`${activity} — failed`);throw error;}
+    }catch(error){if(optionHistory){const context=options.tradeContext??{},diag={symbol,optionType:context.optionType??(/(CE|PE)$/.exec(symbol)?.[1]??null),strike:context.strike??null,expiryDate:context.expiryDate??null,tradeDate:context.tradeDate??d,underlyingSpotAtBreakout:context.underlyingSpotAtBreakout??null,breakoutTimestamp:context.breakoutTimestamp??null,requiredEntryTimestamp:context.requiredEntryTimestamp??null,resolution,endpoint:`GET ${DATA}/history`,params,httpStatus:responseMeta?.httpStatus??null,fyersCode:responseMeta?.fyersCode??null,fyersMessage:responseMeta?.fyersMessage??null,rawCandleCount:responseMeta?.rawCandleCount??null,parsedCandleCount:null,firstRawCandleTimestamp:responseMeta?.firstRawCandleTimestamp??null,lastRawCandleTimestamp:responseMeta?.lastRawCandleTimestamp??null,firstParsedCandleTimestamp:null,lastParsedCandleTimestamp:null,failureReason:redact(error.message,[token])};emitOptionDiagnostic(diag);error.optionHistoryDiagnostic=diag;}report("failed",`${activity} — failed`);throw error;}
   }
   Object.defineProperty(out,"diagnostics",{value:{invalidOutsideSessionCount},enumerable:false});
   return out;
@@ -231,7 +242,19 @@ export async function expiredSymbols(token,symbol,expiry,options={}){
 export async function expiredHistory(token,symbol,resolution,from,to,options={}){
   if(to>=ymdIST(Date.now()/1000))throw new Error(`FYERS expired history endpoint requires expired contracts and past dates; refusing range_to=${to}`);
   const params={symbol,resolution,date_format:1,range_from:from,range_to:to,include_greeks:0,include_oi:0};
-  return parseCandles(await get("/history/fno/expired/historical-data",params,token,{...options,purpose:options.purpose??"expired option premium"}),resolution,{endpoint:"GET /history/fno/expired/historical-data",symbol,resolution,date:from,params,token});
+  let responseMeta=null;const endpoint="GET /history/fno/expired/historical-data",trade=options.tradeContext??{};
+  const base={symbol,optionType:trade.optionType??(/(CE|PE)$/.exec(symbol)?.[1]??null),strike:trade.strike??null,expiryDate:trade.expiryDate??null,tradeDate:trade.tradeDate??from,underlyingSpotAtBreakout:trade.underlyingSpotAtBreakout??null,
+    breakoutTimestamp:trade.breakoutTimestamp??null,requiredEntryTimestamp:trade.requiredEntryTimestamp??null,resolution,endpoint,params,httpStatus:null,fyersCode:null,fyersMessage:null,
+    rawCandleCount:null,parsedCandleCount:null,firstRawCandleTimestamp:null,lastRawCandleTimestamp:null,firstParsedCandleTimestamp:null,lastParsedCandleTimestamp:null};
+  const emit=(diagnostic)=>{options.onPremiumDiagnostic?.(diagnostic);if(process.env.NODE_ENV==="development")console.info(`OPTION HISTORY DIAGNOSTIC\n${JSON.stringify(diagnostic,null,2)}`);};
+  try{
+    const body=await get("/history/fno/expired/historical-data",params,token,{...options,purpose:options.purpose??"expired option premium",onResponse:meta=>{responseMeta=meta;Object.assign(base,meta);options.onResponse?.(meta);}});
+    const candles=parseCandles(body,resolution,{endpoint,symbol,resolution,date:from,params,token});
+    const diagnostic={...base,parsedCandleCount:candles.length,firstParsedCandleTimestamp:candles[0]?.t??null,lastParsedCandleTimestamp:candles.at(-1)?.t??null,failureReason:null};
+    Object.defineProperty(candles,"historyDiagnostic",{value:diagnostic,enumerable:false});emit(diagnostic);return candles;
+  }catch(error){
+    const diagnostic={...base,...(responseMeta??{}),failureReason:redact(error.message,[token])};emit(diagnostic);error.optionHistoryDiagnostic=diagnostic;throw error;
+  }
 }
 export async function activeOptionHistory(token,symbol,resolution,from,to,options={}){
   return history(token,symbol,resolution,from,to,{...options,purpose:options.purpose??"active option premium"});

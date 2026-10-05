@@ -30,6 +30,11 @@ test("optimiser prepares once, caches all FYERS resources, fixes resolution and 
  assert.equal(r.status,"complete");assert.equal(r.processed,16);assert.equal(r.materialisedRows,16);assert.equal(r.exhaustive,true);assert.equal(r.resolution,"1");
  const page=await r.store.page(0);assert.equal(page.rows.length,16);assert.ok(page.rows.every(x=>x.resolution==="1"));assert.ok(page.rows.every((x,i)=>i===0||page.rows[i-1].totalReturnPct>=x.totalReturnPct));assert.deepEqual(r.best,page.rows[0]);
  assert.ok([...p.calls.values()].every(n=>n===1));assert.equal([...p.calls.keys()].filter(k=>k.startsWith("options")).length,1);
+ assert.ok(progress.some(s=>s.preparationStages?.weekly_expiries?.completed>0));
+ assert.ok(progress.some(s=>s.preparationStages?.option_contracts));
+ assert.ok(progress.some(s=>s.preparationStages?.option_premiums));
+ assert.ok(progress.some(s=>s.evaluationProgress?.total===16&&s.evaluationProgress.completed>0));
+ assert.equal(progress.at(-1).status,"complete");
  const data=await prepareMarket(store,cfg);const detailed=await simulate(data,{...cfg,...r.best});assert.equal(detailed.summary.totalReturnPct,r.best.totalReturnPct);assert.ok([...p.calls.values()].every(n=>n===1));assert.ok(progress.some(s=>s.processed>=10));
 });
 const huge={...opt,emaMin:5,emaMax:300,slopeMin:1,slopeMax:50,validMin:1,validMax:20,rrMin:1,rrMax:10,rrStep:.5,lossMin:1,lossMax:20,stopDistanceMin:0,stopDistanceMax:0,stopDistanceStep:.1,expiryType:"ALL"};

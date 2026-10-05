@@ -41,6 +41,28 @@ export function findPremium(candles,t,deadline){
   }
   return null;
 }
+const timestampView=t=>Number.isFinite(t)?{epochSeconds:t,isoUtc:new Date(t*1000).toISOString(),isoIST:new Date((t+19800)*1000).toISOString().replace("Z","+05:30")}:null;
+function optionPremiumLookupDiagnostic(fetchDiagnostic,candles,entryTimestamp,deadline,contract,trigger,cfg,day){
+  const lower=lowerBound(candles,entryTimestamp),exact=candles[lower]?.t===entryTimestamp;
+  // These are temporal neighbors of the requested timestamp: previous is
+  // strictly before it; next is the first candle at or after it (including an
+  // exact match). This keeps diagnostics useful when timestamp matching fails.
+  const previous=lower>0?candles[lower-1]:null,next=candles[lower]??null;
+  const eligible=candles.filter(c=>c.t>=entryTimestamp&&c.t<=deadline),valid=eligible.filter(c=>c.o>0&&c.v>0);
+  const failureReason=valid.length?null:!candles.length?"FYERS returned zero parsed option candles":!eligible.length?`No option candle falls at/after the required entry timestamp and before pending deadline ${timestampView(deadline)?.isoUtc}`:"Option candles exist in the entry window, but none satisfy the existing premium fill rule (open > 0 and volume > 0)";
+  return {...(fetchDiagnostic??{}),symbol:contract.symbol,optionType:contract.optionType,strike:contract.strike,expiryDate:contract.expiryDate,expiryType:contract.expiryType,tradeDate:day,rawCandleCount:fetchDiagnostic?.rawCandleCount??null,parsedCandleCount:fetchDiagnostic?.parsedCandleCount??candles.length,
+    underlyingSpotAtBreakout:trigger.spot,atmSelectionRule:"Nearest actual FYERS contract strike by absolute spot distance; ties choose the lower strike",exactContractSymbolFromMetadata:contract.symbol,contractMetadataSource:contract.expiryTypeSource??"FYERS contract metadata",contractRepresentation:contract.contractRepresentation??"OBJECT",
+    breakoutTimestamp:timestampView(trigger.t),requiredEntryTimestamp:timestampView(entryTimestamp),resolution:cfg.optionResolution,
+    exactTimestampMatchingRequired:false,fillRule:"First valid option candle open at or after the confirmed breakout timestamp; exact timestamp equality is not required",
+    exactEntryMatch:exact,previousCandle:previous?{timestamp:timestampView(previous.t),differenceSeconds:entryTimestamp-previous.t}:null,
+    nextCandle:next?{timestamp:timestampView(next.t),differenceSeconds:next.t-entryTimestamp}:null,
+    pendingEntryDeadline:timestampView(deadline),entryWindowCandles:eligible.length,validFillCandles:valid.length,fillTimestamp:null,failureReason};
+}
+function optionDiagnosticText(d){
+  if(!d)return "";
+  const view=x=>x?.isoUtc??x??"unavailable",params=d.params??{};
+  return `OPTION HISTORY DIAGNOSTIC\nsymbol: ${d.symbol}\noptionType: ${d.optionType}\nstrike: ${d.strike}\nexpiryDate: ${d.expiryDate}\ntradeDate: ${d.tradeDate}\nunderlyingSpotAtBreakout: ${d.underlyingSpotAtBreakout??"unavailable"}\natmSelectionRule: ${d.atmSelectionRule??"nearest actual contract strike by absolute spot distance; ties choose lower strike"}\ncontractMetadataSource: ${d.contractMetadataSource??"FYERS returned contract symbol"}\ncontractRepresentation: ${d.contractRepresentation??"unavailable"}\nexactContractSymbolFromMetadata: ${d.exactContractSymbolFromMetadata??d.symbol}\nbreakoutTimestamp: ${view(d.breakoutTimestamp)}\nrequiredEntryTimestamp: ${view(d.requiredEntryTimestamp)}\nexactTimestampMatchingRequired: ${d.exactTimestampMatchingRequired??"unavailable"}\nfillRule: ${d.fillRule??"first valid option candle at/after breakout"}\nresolution: ${d.resolution}\nendpoint: ${d.endpoint??"unavailable"}\nparams: ${JSON.stringify(params)}\nhttpStatus: ${d.httpStatus??"unavailable"}\nfyersCode: ${d.fyersCode??"unavailable"}\nfyersMessage: ${d.fyersMessage??"unavailable"}\nrawCandles: ${d.rawCandleCount??"unavailable"}\nparsedCandles: ${d.parsedCandleCount??"unavailable"}\nfirstRawCandleTimestamp: ${view(d.firstRawCandleTimestamp)}\nlastRawCandleTimestamp: ${view(d.lastRawCandleTimestamp)}\nfirstParsedCandleTimestamp: ${view(d.firstParsedCandleTimestamp)}\nlastParsedCandleTimestamp: ${view(d.lastParsedCandleTimestamp)}\nexactEntryMatch: ${d.exactEntryMatch===true?"YES":d.exactEntryMatch===false?"NO":"NOT CHECKED"}\nnearestPreviousCandle: ${JSON.stringify(d.previousCandle??null)}\nnearestNextCandle: ${JSON.stringify(d.nextCandle??null)}\nfailureReason: ${d.failureReason??"none"}`;
+}
 export function resultSummary(trades,startingCapital,skipped=[]){
   const sum=k=>trades.reduce((s,t)=>s+(t[k]||0),0),wins=trades.filter(t=>t.netPnl>0),losses=trades.filter(t=>t.netPnl<0);
   let peak=startingCapital,maxDrawdownPct=0,w=0,l=0,maxConsecutiveWins=0,maxConsecutiveLosses=0;
@@ -90,7 +112,7 @@ export function exitEvent(data,candidate,cfg,entry,sl,target){
   if(!exit){const m=rows[lowerBound(rows,end)];if(m?.t!==end)throw new Error(`Required underlying 5S 15:15 open unavailable on ${candidate.day}`);exit={t:end,reason:"15:15",spot:m.o};}
   return remember(data,data.exits,key,exit);
 }
-export async function simulate(data,cfg,{check=()=>{},yieldEvery=100,onPreparationProgress=()=>{}}={}){
+export async function simulate(data,cfg,{check=()=>{},yieldEvery=100,onPreparationProgress=()=>{},onOptionHistoryDiagnostic=()=>{}}={}){
   const trades=[],skipped=[],signals=candidates(data,cfg),pipelineCounters={eligible1mCandles:data.strategy.filter(c=>{const d=ymdIST(c.t);return d>=cfg.startDate&&d<=cfg.endDate&&inSession(c.t);}).length,
     buyASignals:0,buyBSignals:0,sellASignals:0,sellBSignals:0,signalsPassingMinStopDistance:0,pendingSetups:0,breakoutsTriggered:0,entriesRequiringOptions:0,
     weeklyExpiriesResolved:new Set(data.applicableExpiryByDay?.values?.()??[]).size,optionContractsResolved:0,optionPremiumHistoriesLoaded:new Set(),tradesExecuted:0};
@@ -103,8 +125,11 @@ export async function simulate(data,cfg,{check=()=>{},yieldEvery=100,onPreparati
   const incompleteTradeData=message=>Object.assign(new Error(message),{code:"INCOMPLETE_MARKET_DATA",incompleteData:true,pipelineCounters:pipelineSnapshot(),marketData:marketDataSummary(data,cfg)});
   let capital=cfg.startingCapital,busyUntil=-Infinity,losses=0,lastDay=null,count=0;
   const actualContracts=new Set(),validatedPremiumHistories=new Set();
+  const runTotal=signals.length;
+  onPreparationProgress({stage:"running_backtest",status:runTotal?"processing":"complete",completed:0,total:runTotal,unit:"signals",activity:runTotal?`Running backtest — 0 / ${runTotal} signal candidates`:"Running backtest — no eligible signal candidates"});
   for(const candidate of signals){
     check();if(++count%yieldEvery===0)await new Promise(resolve=>setImmediate(resolve));
+    if(count===1||count%yieldEvery===0||count===runTotal)onPreparationProgress({stage:"running_backtest",status:"processing",completed:count,total:runTotal,unit:"signals",activity:`Running backtest — ${count} / ${runTotal} signal candidates`});
     const {sc,sig,day,ema,emaPrevious}=candidate,close=sc.t+Number(cfg.resolution)*60,end=sessionDateEpoch(day,"15:15");
     if(day!==lastDay){lastDay=day;losses=0;busyUntil=-Infinity;}
     if(close>=end||close<=busyUntil||losses>=cfg.maxConsecutiveLosses||sc.h<=sc.l)continue;
@@ -133,11 +158,18 @@ export async function simulate(data,cfg,{check=()=>{},yieldEvery=100,onPreparati
     pipelineCounters.optionContractsResolved++;
     const historyKey=`${contract.symbol}:${day}`;
     onPreparationProgress({stage:"option_premiums",status:"fetching",completed:validatedPremiumHistories.size,total:null,unit:"histories",activity:`Fetching historical option premium — ${contract.symbol} — ${day}`});
-    let oc;try{oc=await data.getOptions(contract,day);}catch(error){throw incompleteTradeData(error.message);}
+    let oc;try{oc=await data.getOptions(contract,day,{breakoutTimestamp:trigger.t,requiredEntryTimestamp:trigger.t,atmReferenceSpot:trigger.spot,onDiagnostic:diagnostic=>onOptionHistoryDiagnostic(diagnostic)});}catch(error){
+      onOptionHistoryDiagnostic(error.optionHistoryDiagnostic??{symbol:contract.symbol,optionType, strike:contract.strike,expiryDate:expiry,tradeDate:day,breakoutTimestamp:timestampView(trigger.t),requiredEntryTimestamp:timestampView(trigger.t),resolution:cfg.optionResolution,endpoint:error.optionHistoryDiagnostic?.endpoint??"unknown",params:error.optionHistoryDiagnostic?.params??{},httpStatus:error.optionHistoryDiagnostic?.httpStatus??null,failureReason:error.message});
+      throw incompleteTradeData(`${error.message}${error.optionHistoryDiagnostic?`\n${optionDiagnosticText(error.optionHistoryDiagnostic)}`:""}`);
+    }
     pipelineCounters.optionPremiumHistoriesLoaded.add(`${contract.symbol}:${day}`);
-    if(!oc.length)throw incompleteTradeData(`FYERS ${cfg.optionResolution} option premium data unavailable: ${contract.symbol} ${day}. No premium fabricated.`);
     const ep=findPremium(oc,trigger.t,b.end-1);
-    if(!ep)throw incompleteTradeData(`Required option entry premium unavailable after breakout for ${contract.symbol} on ${day}; no premium may be fabricated`);
+    const premiumDiagnostic=optionPremiumLookupDiagnostic(oc.historyDiagnostic,oc,trigger.t,b.end-1,contract,trigger,cfg,day);
+    premiumDiagnostic.exactEntryMatch=oc.some(c=>c.t===trigger.t);
+    premiumDiagnostic.entryOptionTimestamp=ep?timestampView(ep.t):null;premiumDiagnostic.entryOptionPremium=ep?.price??null;
+    premiumDiagnostic.failureReason=ep?null:premiumDiagnostic.failureReason;
+    onOptionHistoryDiagnostic(premiumDiagnostic);
+    if(!ep)throw incompleteTradeData(`Required option entry premium unavailable after breakout for ${contract.symbol} on ${day}; no premium may be fabricated.\n${optionDiagnosticText(premiumDiagnostic)}`);
     // The pending entry occupies time until its actual premium fill. Risk monitoring
     // starts only at that fill, never in the bar before the position existed.
     const risk=sc.h-sc.l,sl=sig.side==="BUY"?sc.l:sc.h,target=sig.side==="BUY"?sc.h+risk*cfg.rr:sc.l-risk*cfg.rr;
@@ -163,7 +195,7 @@ export async function simulate(data,cfg,{check=()=>{},yieldEvery=100,onPreparati
       underlyingSL:sl,underlyingTarget:target,exitEventTime:iso(exit.t),exitTime:iso(xp.t),spotExit:exitSpot.o,optionExitPremium:xp.price,exitReason:exit.reason,
       grossPnl:gross,grossProfit:Math.max(0,gross),grossLoss:Math.min(0,gross),...Object.fromEntries(CHARGE_KEYS.map(k=>[k,charges[k]])),totalCharges:charges.total,
       netPnl:net,netProfit:Math.max(0,net),netLoss:Math.min(0,net),capitalAfter:capital,tradeReturnPct:before>0?net/before*100:null,
-      underlyingResolution:"5S",optionPriceResolution:cfg.optionResolution,optionPriceAccuracy:cfg.optionResolution==="5S"?"FYERS_5_SECOND_OHLC_OPEN":"FYERS_1_MINUTE_OHLC_OPEN",
+      underlyingResolution:"5S",optionPriceResolution:cfg.optionResolution,optionHistoryDiagnostic:premiumDiagnostic,optionPriceAccuracy:cfg.optionResolution==="5S"?"FYERS_5_SECOND_OHLC_OPEN":"FYERS_1_MINUTE_OHLC_OPEN",
       fillRule:FILL_RULE,source:"FYERS_HISTORY_AND_EXPIRED_FNO",expiryTypeSource:contract.expiryTypeSource});
     losses=net<0?losses+1:0;
   }
@@ -171,6 +203,7 @@ export async function simulate(data,cfg,{check=()=>{},yieldEvery=100,onPreparati
   pipelineCounters.tradesExecuted=trades.length;
   onPreparationProgress({stage:"option_contracts",status:"complete",completed:actualContracts.size,total:actualContracts.size,unit:"contracts",activity:`Required ATM option contracts resolved — ${actualContracts.size} / ${actualContracts.size}`});
   onPreparationProgress({stage:"option_premiums",status:"complete",completed:validatedPremiumHistories.size,total:validatedPremiumHistories.size,unit:"histories",activity:`Required option premium histories validated — ${validatedPremiumHistories.size} / ${validatedPremiumHistories.size}`});
+  onPreparationProgress({stage:"running_backtest",status:"complete",completed:runTotal,total:runTotal,unit:"signals",activity:`Backtest calculation complete — ${runTotal} / ${runTotal} signal candidates`});
   return {config:cfg,summary:resultSummary(trades,cfg.startingCapital,skipped),marketData:marketDataSummary(data,cfg),pipelineCounters,trades,skipped};
 }
 export async function backtest(token,input,options={}){
